@@ -9,10 +9,10 @@ from google_sheets import fetch_google_sheet, load_saved_url, save_url
 st.set_page_config(page_title="NID & NRBC Daily Reporting Dashboard", layout="wide")
 st.title("🧾 NID & NRBC Daily Reporting Dashboard")
 st.caption(
-    "Connects to the Google Sheet backing the reporting form, or accepts a manual "
-    "Excel upload. Note: Birth Registration and National ID (NID) Registration are "
-    "two separate activities captured on the same form — they're tracked "
-    "side-by-side below, not as a before/after pipeline."
+    "Connects to the Google Sheet backing the Daily Reporting form, or accepts a manual "
+    "Excel upload. Birth Registration and National ID (NID) Registration are "
+    "two separate activities captured on the same form tracked "
+    "side-by-side below."
 )
 
 # ------------------------------------------------------------------
