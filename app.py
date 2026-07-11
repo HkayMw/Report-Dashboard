@@ -11,7 +11,8 @@ from column_mapping import (
 )
 from auth import verify_pin, set_pin, is_default_pin_active
 from master_reference import (
-    load_master, check_submissions_against_master, reporting_status, centers_never_reported
+    load_master, check_submissions_against_master, reporting_status,
+    center_completion, centers_never_reported
 )
 
 st.set_page_config(page_title="NID & NRBC Daily Reporting Dashboard", layout="wide")
@@ -524,6 +525,29 @@ with tab5:
             st.warning(f"{len(missing_today)} center(s) have not reported for {picked_date}.")
             missing_df = pd.DataFrame(missing_today, columns=["Zone", "Center"]).sort_values(["Zone", "Center"])
             st.dataframe(missing_df)
+
+    st.subheader(f"Center completion ({status_start} to {status_end})")
+    st.caption(
+        "How consistently each center has been reporting — days actually reported "
+        "out of every day in the selected range, same denominator for all centers."
+    )
+    completion = center_completion(cleaned_df, master_df_scope, status_start, status_end)
+    n_full = int((completion["Completion %"] == 100).sum())
+    n_partial = int(((completion["Completion %"] > 0) & (completion["Completion %"] < 100)).sum())
+    n_zero = int((completion["Completion %"] == 0).sum())
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Fully reporting (100%)", n_full)
+    c2.metric("Partially reporting", n_partial)
+    c3.metric("Zero reports", n_zero)
+    st.dataframe(
+        completion,
+        hide_index=True,
+        column_config={
+            "Completion %": st.column_config.ProgressColumn(
+                "Completion %", min_value=0, max_value=100, format="%.0f%%"
+            )
+        },
+    )
 
     st.subheader(f"Centers with zero reports in this range ({status_start} to {status_end})")
     never = centers_never_reported(cleaned_df, master_df_scope, status_start, status_end)

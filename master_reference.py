@@ -20,6 +20,20 @@ def _normalize(s: str) -> str:
     return s
 
 
+# Common suffixes PEAs tack onto a center's real name when filling the form
+# (e.g. "CHIBAVI PRIMARY SCHOOL" for a master-listed center just called "CHIBAVI").
+# Stripped iteratively so combinations like "... PRIMARY SCHOOL" reduce fully.
+_SUFFIX_NOISE_PATTERN = re.compile(r"\s+(PRIMARY SCHOOL|SCHOOL|PRIMARY|P/S|P\.S\.?|PS)$")
+
+
+def _strip_suffix_noise(s_norm: str) -> str:
+    prev, cur = None, s_norm
+    while prev != cur:
+        prev = cur
+        cur = _SUFFIX_NOISE_PATTERN.sub("", cur).strip()
+    return cur
+
+
 def load_master() -> pd.DataFrame:
     df = pd.read_csv(REFERENCE_PATH)
     df["Zone_norm"] = df["Zone"].apply(_normalize)
@@ -132,6 +146,22 @@ def check_submissions_against_master(cleaned_df: pd.DataFrame, master_df: pd.Dat
                                    f"'{display_zones}', not '{zone}'. Check which is correct.",
                 })
                 continue
+            # Suffix-noise match: e.g. "CHIBAVI PRIMARY SCHOOL" -> "CHIBAVI". This is a much
+            # stronger signal than raw string-similarity ratio, since a long common suffix
+            # tanks the ratio even when the core name is an exact match, so it's checked first.
+            stripped_nc = _strip_suffix_noise(nc)
+            if stripped_nc != nc and stripped_nc in by_zone.get(nz, set()):
+                correct_center = next(
+                    c for c in master_df[master_df["Zone_norm"] == nz]["Center"]
+                    if _normalize(c) == stripped_nc
+                )
+                issues.append({
+                    "zone": zone, "center": center, "issue": "center_typo",
+                    "suggestion": f"'{center}' doesn't match any known center under '{zone}' exactly, "
+                                   f"but matches after removing a common suffix like 'PRIMARY SCHOOL'. "
+                                   f"Closest match: '{correct_center}'.",
+                })
+                continue
             center_matches = difflib.get_close_matches(nc, by_zone.get(nz, set()), n=1, cutoff=0.6)
             if center_matches:
                 correct_center = next(
@@ -191,6 +221,37 @@ def reporting_status(cleaned_df: pd.DataFrame, master_df: pd.DataFrame, start_da
 
     daily_summary = pd.DataFrame(daily_rows)
     return daily_summary, missing_by_date
+
+
+def center_completion(cleaned_df: pd.DataFrame, master_df: pd.DataFrame, start_date, end_date):
+    """
+    For each master (zone, center) pair, how many days in [start_date, end_date]
+    did they submit at least one report, out of the full range (same denominator
+    for every center, regardless of when they started reporting).
+
+    Returns a DataFrame: Zone, Center, Days Reported, Days Expected, Completion %
+    sorted by Completion % descending.
+    """
+    pairs_df = master_df[["Zone", "Center", "Zone_norm", "Center_norm"]].drop_duplicates().copy()
+
+    sub = cleaned_df.copy()
+    sub["_zone_norm"] = sub["ZONE NAME"].apply(_normalize)
+    sub["_center_norm"] = sub["CENTER NAME"].apply(_normalize)
+    sub["_date"] = sub["Date"].dt.date
+    sub = sub[(sub["_date"] >= start_date) & (sub["_date"] <= end_date)]
+
+    days_reported = sub.groupby(["_zone_norm", "_center_norm"])["_date"].nunique()
+    total_days = (end_date - start_date).days + 1
+
+    pairs_df["Days Reported"] = pairs_df.apply(
+        lambda r: int(days_reported.get((r["Zone_norm"], r["Center_norm"]), 0)), axis=1
+    )
+    pairs_df["Days Expected"] = total_days
+    pairs_df["Completion %"] = (pairs_df["Days Reported"] / total_days * 100).round(1) if total_days else 0.0
+
+    result = pairs_df[["Zone", "Center", "Days Reported", "Days Expected", "Completion %"]]
+    result = result.sort_values(["Completion %", "Zone", "Center"], ascending=[False, True, True])
+    return result.reset_index(drop=True)
 
 
 def centers_never_reported(cleaned_df: pd.DataFrame, master_df: pd.DataFrame, start_date, end_date):
