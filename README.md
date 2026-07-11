@@ -29,6 +29,31 @@ not a before/after pipeline:
 The app tracks these as two independent metrics throughout (KPIs, charts,
 exports) rather than computing a "processing rate" between them.
 
+## Admin access vs. viewer access
+
+To stop casual viewers from interfering with the data connection or
+accidentally uploading files, the app has two access levels:
+
+- **Viewers** (no login): see the full dashboard — filters, KPIs, charts,
+  data-quality info — using whatever data source is already connected.
+  They cannot change the Google Sheet link, upload a file, confirm
+  zone/center name merges, or export.
+- **Admin** (PIN required, entered in the sidebar): unlocks the Data Source
+  panel (Google Sheet URL / manual upload), the column-mapping confirmation
+  step, the zone/center typo-merge controls, and the Export button.
+
+**First run:** the default admin PIN is `1234`. Log in with it once, then
+use the "Change admin PIN" box in the sidebar to set your own — the app
+will nag you in the sidebar until you do. The PIN is stored (hashed) in
+`config.json` next to the app.
+
+⚠️ This is a basic deterrent, not real security — there's no rate-limiting,
+no per-user accounts, and the config file is plain text on disk. Fine for
+keeping honest people from poking at the data connection on a shared
+machine or local network; not sufficient if you deploy this somewhere
+publicly reachable. For that, swap in real auth (e.g. `streamlit-authenticator`,
+or put it behind SSO).
+
 ## Connecting to Google Sheets (live data, no upload needed)
 
 If your Google Form writes to a Google Sheet, you can point the app straight
@@ -49,6 +74,20 @@ The app will:
 If the sheet is private, this simple method won't work — that requires a
 Google service account with proper OAuth credentials, which is a bigger setup.
 Let me know if you need that instead.
+
+## Handling changes to the form (column mapping)
+
+The app doesn't require exact column names anymore. If a header gets renamed,
+reordered, or slightly reworded (e.g. "Centre" instead of "CENTER NAME"), it
+auto-matches based on similarity. If a column can't be confidently matched,
+a **Column Mapping** panel appears asking you to pick the right source
+column for each required field. Once confirmed, the mapping is remembered
+(saved to `config.json`) so you won't be asked again for the same headers.
+
+This makes the app resilient to *drift* in this same form — it does not make
+it a generic "any spreadsheet" tool. It still expects the same underlying
+concepts (a zone, a center, a date, and the four birth/NID count fields) to
+exist somewhere in the file, just not necessarily under the exact same names.
 
 ## Usage
 

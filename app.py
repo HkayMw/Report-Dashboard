@@ -5,14 +5,17 @@ import plotly.express as px
 from data_processing import load_raw, clean_data, find_fuzzy_suggestions, prepare_raw_columns
 from report_generator import build_report
 from google_sheets import fetch_google_sheet, load_saved_url, save_url
+from column_mapping import (
+    suggest_mapping, load_saved_mapping, save_mapping, apply_mapping, REQUIRED_FIELDS
+)
+from auth import verify_pin, set_pin, is_default_pin_active
 
 st.set_page_config(page_title="NID & NRBC Daily Reporting Dashboard", layout="wide")
 st.title("🧾 NID & NRBC Daily Reporting Dashboard")
 st.caption(
-    "Connects to the Google Sheet backing the Daily Reporting form, or accepts a manual "
-    "Excel upload. Birth Registration and National ID (NID) Registration are "
-    "two separate activities captured on the same form tracked "
-    "side-by-side below."
+    "Note: Birth Registration and National ID (NID) Registration are "
+    "two separate activities captured on the same form — they're tracked "
+    "side-by-side below, not as a before/after pipeline."
 )
 
 # ------------------------------------------------------------------
@@ -22,60 +25,178 @@ if "confirmed_merges" not in st.session_state:
     st.session_state.confirmed_merges = {"zone": {}, "center": {}}
 if "sheet_refresh_token" not in st.session_state:
     st.session_state.sheet_refresh_token = 0
+if "is_admin" not in st.session_state:
+    st.session_state.is_admin = False
+
+# ------------------------------------------------------------------
+# Admin login (sidebar)
+# ------------------------------------------------------------------
+st.sidebar.header("Admin")
+if st.session_state.is_admin:
+    st.sidebar.success("Admin mode active.")
+    if st.sidebar.button("Log out"):
+        st.session_state.is_admin = False
+        st.rerun()
+    if is_default_pin_active():
+        st.sidebar.warning("Still using the default PIN (1234) — change it below.")
+    with st.sidebar.expander("Change admin PIN"):
+        new_pin = st.text_input("New PIN", type="password", key="new_pin_input")
+        if st.button("Update PIN"):
+            if new_pin and len(new_pin) >= 4:
+                set_pin(new_pin)
+                st.sidebar.success("PIN updated.")
+            else:
+                st.sidebar.error("PIN must be at least 4 characters.")
+else:
+    pin_attempt = st.sidebar.text_input("Enter admin PIN", type="password", key="pin_attempt")
+    if st.sidebar.button("Log in"):
+        if verify_pin(pin_attempt):
+            st.session_state.is_admin = True
+            st.rerun()
+        else:
+            st.sidebar.error("Incorrect PIN.")
+
+is_admin = st.session_state.is_admin
 
 # ------------------------------------------------------------------
 # Data source: Google Sheet (live) or manual upload
+# Admins configure the connection; everyone else just gets the data it
+# already points to, read-only, so viewers can't interfere with the link
+# or accidentally trigger uploads.
 # ------------------------------------------------------------------
-st.subheader("Data Source")
-source_mode = st.radio(
-    "Where should the data come from?",
-    ["Google Sheet (live)", "Upload Excel file"],
-    horizontal=True,
-)
-
 raw_df = None
+saved_url = load_saved_url()
 
-if source_mode == "Google Sheet (live)":
-    default_url = load_saved_url()
-    sheet_url = st.text_input(
-        "Google Sheet URL (must be shared as 'Anyone with the link can view')",
-        value=default_url,
-        placeholder="https://docs.google.com/spreadsheets/d/....../edit",
+if is_admin:
+    st.subheader("Data Source (admin)")
+    source_mode = st.radio(
+        "Where should the data come from?",
+        ["Google Sheet (live)", "Upload Excel file"],
+        horizontal=True,
     )
-    col_a, col_b = st.columns([1, 4])
-    refresh_clicked = col_a.button("🔄 Refresh now")
 
-    if sheet_url:
-        if sheet_url != default_url:
-            save_url(sheet_url)
-        if refresh_clicked:
-            st.session_state.sheet_refresh_token += 1
+    if source_mode == "Google Sheet (live)":
+        sheet_url = st.text_input(
+            "Google Sheet URL (must be shared as 'Anyone with the link can view')",
+            value=saved_url,
+            placeholder="https://docs.google.com/spreadsheets/d/....../edit",
+        )
+        col_a, col_b = st.columns([1, 4])
+        refresh_clicked = col_a.button("🔄 Refresh now")
 
-        @st.cache_data(ttl=300, show_spinner="Fetching latest responses from Google Sheets...")
-        def _cached_fetch(url, _refresh_token):
+        if sheet_url:
+            if sheet_url != saved_url:
+                save_url(sheet_url)
+            if refresh_clicked:
+                st.session_state.sheet_refresh_token += 1
+
+            @st.cache_data(ttl=300, show_spinner="Fetching latest responses from Google Sheets...")
+            def _cached_fetch(url, _refresh_token):
+                return fetch_google_sheet(url)
+
+            try:
+                fetched = _cached_fetch(sheet_url, st.session_state.sheet_refresh_token)
+                raw_df = prepare_raw_columns(fetched)
+                col_b.success(f"Loaded {len(raw_df)} rows from Google Sheets.", icon="✅")
+            except RuntimeError as e:
+                st.error(str(e))
+        else:
+            st.info("Paste the Google Sheet URL above to load data automatically.")
+    else:
+        st.caption("Note: an uploaded file is only visible in this admin session — "
+                   "regular viewers will still see the connected Google Sheet, not this upload.")
+        uploaded_file = st.file_uploader("Upload the Excel file (.xlsx)", type=["xlsx"])
+        if uploaded_file is not None:
+            raw_df = load_raw(uploaded_file)
+
+else:
+    # Viewer path: silently use whatever the admin has already connected.
+    if saved_url:
+        @st.cache_data(ttl=300, show_spinner="Loading latest data...")
+        def _cached_fetch_viewer(url):
             return fetch_google_sheet(url)
 
         try:
-            fetched = _cached_fetch(sheet_url, st.session_state.sheet_refresh_token)
+            fetched = _cached_fetch_viewer(saved_url)
             raw_df = prepare_raw_columns(fetched)
-            col_b.success(f"Loaded {len(raw_df)} rows from Google Sheets.", icon="✅")
         except RuntimeError as e:
-            st.error(str(e))
+            st.error(f"Couldn't load the connected data source: {e}")
     else:
-        st.info("Paste the Google Sheet URL above to load data automatically.")
-
-else:
-    uploaded_file = st.file_uploader("Upload the Excel file (.xlsx)", type=["xlsx"])
-    if uploaded_file is not None:
-        raw_df = load_raw(uploaded_file)
+        st.info("No data source has been connected yet. An admin needs to log in and connect one.")
 
 if raw_df is None:
     st.stop()
 
+# ------------------------------------------------------------------
+# Column mapping — makes the app resilient to header drift (renamed columns,
+# reordered columns, minor wording changes) instead of requiring exact names.
+# This is part of the data connection setup, so it's admin-only; viewers rely
+# on whatever mapping has already been confirmed and saved.
+# ------------------------------------------------------------------
+raw_headers = list(raw_df.columns)
+saved_mapping = load_saved_mapping()
+
+mapping = {h: c for h, c in saved_mapping.items() if h in raw_headers}
+already_mapped_canonicals = set(mapping.values())
+
+confident, suggestions, unmapped = suggest_mapping(
+    [h for h in raw_headers if h not in mapping]
+)
+for h, c in confident.items():
+    if c not in already_mapped_canonicals:
+        mapping[h] = c
+        already_mapped_canonicals.add(c)
+
+needs_review = {
+    c: cands for c, cands in suggestions.items()
+    if c not in already_mapped_canonicals
+}
+
+if needs_review or len(mapping) < len(REQUIRED_FIELDS):
+    if is_admin:
+        with st.expander("🗂️ Column Mapping — please confirm", expanded=True):
+            st.write(
+                "Some columns couldn't be confidently matched to what this app expects. "
+                "Pick the right source column for each field below (or 'None' to skip)."
+            )
+            options = ["(none)"] + raw_headers
+            for canonical in REQUIRED_FIELDS:
+                if canonical in already_mapped_canonicals:
+                    continue
+                candidates = suggestions.get(canonical, [])
+                default_idx = 0
+                if candidates:
+                    best_header = candidates[0][0]
+                    if best_header in options:
+                        default_idx = options.index(best_header)
+                choice = st.selectbox(
+                    f"**{canonical}**" + (f"  _(best guess: {candidates[0][0]}, {candidates[0][1]:.0%} similar)_" if candidates else "  _(no match found)_"),
+                    options, index=default_idx, key=f"map_{canonical}"
+                )
+                if choice != "(none)":
+                    mapping[choice] = canonical
+
+            if st.button("Confirm mapping"):
+                save_mapping(mapping)
+                st.rerun()
+    else:
+        st.warning("The data connection needs setup by an admin before this can be shown.")
+        st.stop()
+
+missing_required = [c for c in REQUIRED_FIELDS if c not in mapping.values()]
+if missing_required:
+    if is_admin:
+        st.error(f"Missing required column(s): {', '.join(missing_required)}. Please map them above.")
+    else:
+        st.warning("The data connection needs setup by an admin before this can be shown.")
+    st.stop()
+
+raw_df = apply_mapping(raw_df, mapping)
 cleaned_df, report = clean_data(raw_df, st.session_state.confirmed_merges)
 
 # ------------------------------------------------------------------
-# Data quality review panel
+# Data quality review panel — informational parts stay visible to everyone;
+# the merge controls (which edit the data) are admin-only.
 # ------------------------------------------------------------------
 with st.expander("🔍 Data Quality Review", expanded=False):
     st.write(f"**Duplicate rows auto-removed (kept latest by timestamp):** {report['duplicates_removed_count']}")
@@ -103,49 +224,50 @@ with st.expander("🔍 Data Quality Review", expanded=False):
             ]
         ])
 
-    st.subheader("Possible Zone Name Typos")
-    zone_suggestions = find_fuzzy_suggestions(cleaned_df, "ZONE NAME")
-    if not zone_suggestions:
-        st.write("No suspected typos found among zone names.")
-    for s in zone_suggestions:
-        c1, c2, c3 = st.columns([3, 1, 2])
-        c1.write(f"**{s['a']}**  ↔  **{s['b']}**  (similarity {s['score']})")
-        choice = c2.radio(
-            "Merge?", ["Keep separate", f"{s['a']} → {s['b']}", f"{s['b']} → {s['a']}"],
-            key=f"zone_{s['a']}_{s['b']}", label_visibility="collapsed"
-        )
-        if choice == f"{s['a']} → {s['b']}":
-            st.session_state.confirmed_merges["zone"][s["a"]] = s["b"]
-        elif choice == f"{s['b']} → {s['a']}":
-            st.session_state.confirmed_merges["zone"][s["b"]] = s["a"]
-        else:
-            st.session_state.confirmed_merges["zone"].pop(s["a"], None)
-            st.session_state.confirmed_merges["zone"].pop(s["b"], None)
+    if is_admin:
+        st.subheader("Possible Zone Name Typos")
+        zone_suggestions = find_fuzzy_suggestions(cleaned_df, "ZONE NAME")
+        if not zone_suggestions:
+            st.write("No suspected typos found among zone names.")
+        for s in zone_suggestions:
+            c1, c2, c3 = st.columns([3, 1, 2])
+            c1.write(f"**{s['a']}**  ↔  **{s['b']}**  (similarity {s['score']})")
+            choice = c2.radio(
+                "Merge?", ["Keep separate", f"{s['a']} → {s['b']}", f"{s['b']} → {s['a']}"],
+                key=f"zone_{s['a']}_{s['b']}", label_visibility="collapsed"
+            )
+            if choice == f"{s['a']} → {s['b']}":
+                st.session_state.confirmed_merges["zone"][s["a"]] = s["b"]
+            elif choice == f"{s['b']} → {s['a']}":
+                st.session_state.confirmed_merges["zone"][s["b"]] = s["a"]
+            else:
+                st.session_state.confirmed_merges["zone"].pop(s["a"], None)
+                st.session_state.confirmed_merges["zone"].pop(s["b"], None)
 
-    st.subheader("Possible Center Name Typos")
-    center_suggestions = find_fuzzy_suggestions(cleaned_df, "CENTER NAME")
-    if not center_suggestions:
-        st.write("No suspected typos found among center names.")
-    for s in center_suggestions:
-        c1, c2, c3 = st.columns([3, 1, 2])
-        c1.write(f"**{s['a']}**  ↔  **{s['b']}**  (similarity {s['score']})")
-        choice = c2.radio(
-            "Merge?", ["Keep separate", f"{s['a']} → {s['b']}", f"{s['b']} → {s['a']}"],
-            key=f"center_{s['a']}_{s['b']}", label_visibility="collapsed"
-        )
-        if choice == f"{s['a']} → {s['b']}":
-            st.session_state.confirmed_merges["center"][s["a"]] = s["b"]
-        elif choice == f"{s['b']} → {s['a']}":
-            st.session_state.confirmed_merges["center"][s["b"]] = s["a"]
-        else:
-            st.session_state.confirmed_merges["center"].pop(s["a"], None)
-            st.session_state.confirmed_merges["center"].pop(s["b"], None)
+        st.subheader("Possible Center Name Typos")
+        center_suggestions = find_fuzzy_suggestions(cleaned_df, "CENTER NAME")
+        if not center_suggestions:
+            st.write("No suspected typos found among center names.")
+        for s in center_suggestions:
+            c1, c2, c3 = st.columns([3, 1, 2])
+            c1.write(f"**{s['a']}**  ↔  **{s['b']}**  (similarity {s['score']})")
+            choice = c2.radio(
+                "Merge?", ["Keep separate", f"{s['a']} → {s['b']}", f"{s['b']} → {s['a']}"],
+                key=f"center_{s['a']}_{s['b']}", label_visibility="collapsed"
+            )
+            if choice == f"{s['a']} → {s['b']}":
+                st.session_state.confirmed_merges["center"][s["a"]] = s["b"]
+            elif choice == f"{s['b']} → {s['a']}":
+                st.session_state.confirmed_merges["center"][s["b"]] = s["a"]
+            else:
+                st.session_state.confirmed_merges["center"].pop(s["a"], None)
+                st.session_state.confirmed_merges["center"].pop(s["b"], None)
 
-    if st.button("Apply confirmed merges"):
-        st.rerun()
+        if st.button("Apply confirmed merges"):
+            st.rerun()
 
 # ------------------------------------------------------------------
-# Sidebar filters
+# Sidebar filters — available to everyone, viewing only
 # ------------------------------------------------------------------
 st.sidebar.header("Filters")
 zones = sorted(cleaned_df["ZONE NAME"].unique())
@@ -228,7 +350,7 @@ center_summary.columns = [
 ]
 
 # ------------------------------------------------------------------
-# Charts
+# Charts — visible to everyone
 # ------------------------------------------------------------------
 tab1, tab2, tab3, tab4 = st.tabs(["By Zone", "By Center", "Trend Over Time", "Male vs Female"])
 
@@ -302,25 +424,26 @@ with tab4:
 st.divider()
 
 # ------------------------------------------------------------------
-# Export
+# Export — admin only
 # ------------------------------------------------------------------
-st.subheader("📤 Export Report")
-kpis = {
-    "Total Birth Registrations": total_birth,
-    "Male Births": total_male_birth,
-    "Female Births": total_female_birth,
-    "Total NID Registrations": total_nid,
-    "Male NID": total_male_nid,
-    "Female NID": total_female_nid,
-    "Number of Zones": filtered["ZONE NAME"].nunique(),
-    "Number of Centers": filtered["CENTER NAME"].nunique(),
-    "Date Range": f"{start_date} to {end_date}",
-}
+if is_admin:
+    st.subheader("📤 Export Report (admin)")
+    kpis = {
+        "Total Birth Registrations": total_birth,
+        "Male Births": total_male_birth,
+        "Female Births": total_female_birth,
+        "Total NID Registrations": total_nid,
+        "Male NID": total_male_nid,
+        "Female NID": total_female_nid,
+        "Number of Zones": filtered["ZONE NAME"].nunique(),
+        "Number of Centers": filtered["CENTER NAME"].nunique(),
+        "Date Range": f"{start_date} to {end_date}",
+    }
 
-excel_bytes = build_report(filtered, report, zone_summary, center_summary, kpis)
-st.download_button(
-    "Download Excel Report",
-    data=excel_bytes,
-    file_name="nrbc_report.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
+    excel_bytes = build_report(filtered, report, zone_summary, center_summary, kpis)
+    st.download_button(
+        "Download Excel Report",
+        data=excel_bytes,
+        file_name="nrbc_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )

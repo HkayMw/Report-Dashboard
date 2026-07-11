@@ -29,10 +29,10 @@ def normalize_text(s):
 
 
 def prepare_raw_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop fully-empty trailing columns and keep only expected columns."""
+    """Drop fully-empty trailing columns. Column selection/renaming to canonical
+    fields now happens via column_mapping.apply_mapping() before this is called
+    downstream, or this can be used standalone for the legacy exact-name path."""
     df = df.dropna(axis=1, how="all")
-    expected_present = [c for c in RAW_COLUMNS if c in df.columns]
-    df = df[expected_present]
     return df
 
 
