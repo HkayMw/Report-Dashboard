@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -9,6 +10,9 @@ from column_mapping import (
     suggest_mapping, load_saved_mapping, save_mapping, apply_mapping, REQUIRED_FIELDS
 )
 from auth import verify_pin, set_pin, is_default_pin_active
+from master_reference import (
+    load_master, check_submissions_against_master, reporting_status, centers_never_reported
+)
 
 st.set_page_config(page_title="NID & NRBC Daily Reporting Dashboard", layout="wide")
 st.title("🧾 NID & NRBC Daily Reporting Dashboard")
@@ -203,13 +207,19 @@ with st.expander("🔍 Data Quality Review", expanded=False):
     if len(report["duplicates_found"]):
         st.dataframe(report["duplicates_found"][["Timestamp", "ZONE NAME", "CENTER NAME", "Date"]])
 
+    DIAG_COLS = ["ZONE NAME", "CENTER NAME", "Date",
+                 "Total Male Births Registered", "Total Female Births Registered",
+                 "Total Males Processed", "Total Females Processed"]
+
     if len(report["missing_numeric_rows"]):
         st.warning(f"{len(report['missing_numeric_rows'])} row(s) had missing numeric values (filled with 0).")
-        st.dataframe(report["missing_numeric_rows"])
+        cols_present = [c for c in DIAG_COLS if c in report["missing_numeric_rows"].columns]
+        st.dataframe(report["missing_numeric_rows"][cols_present].astype(str))
 
     if len(report["negative_rows"]):
         st.warning(f"{len(report['negative_rows'])} row(s) had negative numbers.")
-        st.dataframe(report["negative_rows"])
+        cols_present = [c for c in DIAG_COLS if c in report["negative_rows"].columns]
+        st.dataframe(report["negative_rows"][cols_present].astype(str))
 
     if len(report["non_integer_rows"]):
         st.warning(
@@ -265,6 +275,46 @@ with st.expander("🔍 Data Quality Review", expanded=False):
 
         if st.button("Apply confirmed merges"):
             st.rerun()
+
+    st.subheader("Master Reference Check")
+    st.caption(
+        "Compares submitted zone/center names against the official campaign "
+        "registry (from the NR8-A forms allocation list) — this is the "
+        "authoritative source of correct spellings, not just internal guesswork."
+    )
+    master_df = load_master()
+    master_issues = check_submissions_against_master(cleaned_df, master_df)
+    if not master_issues:
+        st.write("All submitted zone/center combinations match the master reference. ✅")
+    else:
+        st.warning(f"{len(master_issues)} submitted zone/center combination(s) don't match the master reference.")
+        issues_df = pd.DataFrame(master_issues)
+        st.dataframe(issues_df[["zone", "center", "issue", "suggestion"]])
+
+        if is_admin:
+            typo_issues = [i for i in master_issues if i["issue"] in ("zone_typo", "center_typo")]
+            if typo_issues:
+                st.write("**Quick-fix spelling typos** (safe to auto-correct — just renames the field):")
+                for i in typo_issues:
+                    # extract the suggested correct value from the message (after "Closest match: '")
+                    m = re.search(r"Closest match: '([^']+)'", i["suggestion"])
+                    if not m:
+                        continue
+                    correct_value = m.group(1)
+                    field = "zone" if i["issue"] == "zone_typo" else "center"
+                    wrong_value = i["zone"] if field == "zone" else i["center"]
+                    c1, c2 = st.columns([3, 1])
+                    c1.write(f"'{wrong_value}' → '{correct_value}'")
+                    if c2.button("Fix", key=f"masterfix_{field}_{wrong_value}"):
+                        st.session_state.confirmed_merges[field][wrong_value] = correct_value
+                        st.rerun()
+            swap_issues = [i for i in master_issues if i["issue"] in ("zone_center_swap", "wrong_zone_for_center", "unknown")]
+            if swap_issues:
+                st.info(
+                    "Zone/center mix-ups and unrecognized names need manual review — "
+                    "they can't be safely auto-corrected since fixing them may mean moving "
+                    "a value between fields, not just renaming it."
+                )
 
 # ------------------------------------------------------------------
 # Sidebar filters — available to everyone, viewing only
@@ -352,7 +402,9 @@ center_summary.columns = [
 # ------------------------------------------------------------------
 # Charts — visible to everyone
 # ------------------------------------------------------------------
-tab1, tab2, tab3, tab4 = st.tabs(["By Zone", "By Center", "Trend Over Time", "Male vs Female"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["By Zone", "By Center", "Trend Over Time", "Male vs Female", "Reporting Status"]
+)
 
 with tab1:
     fig = px.bar(zone_summary.reset_index(), x="ZONE NAME", y="Total Birth Registrations",
@@ -420,6 +472,66 @@ with tab4:
     overall_nid = pd.DataFrame({"Sex": ["Male", "Female"], "Count": [total_male_nid, total_female_nid]})
     fig_pie2 = px.pie(overall_nid, names="Sex", values="Count", title="Overall NID Registration Male/Female Split")
     st.plotly_chart(fig_pie2, width='stretch')
+
+with tab5:
+    st.markdown(
+        "Tracks which zones/centers **haven't submitted a report yet**, against the "
+        "official master list of all campaign centers — spanning the activity's date "
+        "range. This uses all submitted data regardless of the sidebar filters above; "
+        "the sidebar Zone filter narrows which centers are checked."
+    )
+    master_df = load_master()
+    if selected_zones and set(selected_zones) != set(zones):
+        master_df_scope = master_df[master_df["Zone"].str.upper().isin([z.upper() for z in selected_zones])]
+    else:
+        master_df_scope = master_df
+
+    today = pd.Timestamp.now().date()
+    data_min = cleaned_df["Date"].min().date()
+    data_max = cleaned_df["Date"].max().date()
+    range_upper_bound = max(data_max, today)
+
+    status_range = st.date_input(
+        "Activity date range to check",
+        value=(data_min, data_max),
+        min_value=data_min,
+        max_value=range_upper_bound,
+        key="reporting_status_range",
+    )
+    if isinstance(status_range, tuple) and len(status_range) == 2:
+        status_start, status_end = status_range
+    else:
+        status_start, status_end = data_min, data_max
+
+    daily_summary, missing_by_date = reporting_status(cleaned_df, master_df_scope, status_start, status_end)
+
+    st.subheader("Daily completion")
+    if len(daily_summary) > 1:
+        fig_completion = px.line(daily_summary, x="Date", y="Pct Complete", markers=True,
+                                  title="% of Centers Reported, by Day")
+        fig_completion.update_yaxes(range=[0, 100])
+        st.plotly_chart(fig_completion, width='stretch')
+    st.dataframe(daily_summary)
+
+    st.subheader("Missing reports for a specific day")
+    available_dates = list(daily_summary["Date"])
+    if available_dates:
+        picked_date = st.selectbox("Choose a date", available_dates, index=len(available_dates) - 1)
+        missing_today = missing_by_date.get(picked_date, [])
+        if not missing_today:
+            st.success(f"All {len(master_df_scope[['Zone','Center']].drop_duplicates())} centers reported on {picked_date}. ✅")
+        else:
+            st.warning(f"{len(missing_today)} center(s) have not reported for {picked_date}.")
+            missing_df = pd.DataFrame(missing_today, columns=["Zone", "Center"]).sort_values(["Zone", "Center"])
+            st.dataframe(missing_df)
+
+    st.subheader(f"Centers with zero reports in this range ({status_start} to {status_end})")
+    never = centers_never_reported(cleaned_df, master_df_scope, status_start, status_end)
+    if never.empty:
+        st.success("Every center in scope has reported at least once in this range. ✅")
+    else:
+        st.warning(f"{len(never)} center(s) have not reported at all in this range.")
+        st.dataframe(never)
 
 st.divider()
 
