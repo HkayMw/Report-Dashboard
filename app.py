@@ -357,11 +357,11 @@ tab1, tab2, tab3, tab4 = st.tabs(["By Zone", "By Center", "Trend Over Time", "Ma
 with tab1:
     fig = px.bar(zone_summary.reset_index(), x="ZONE NAME", y="Total Birth Registrations",
                  title="Birth Registrations by Zone", text_auto=True)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     fig_nid = px.bar(zone_summary.reset_index(), x="ZONE NAME", y="Total NID Registrations",
                       title="NID Registrations by Zone", text_auto=True)
-    st.plotly_chart(fig_nid, use_container_width=True)
+    st.plotly_chart(fig_nid, width='stretch')
 
     st.dataframe(zone_summary)
 
@@ -371,12 +371,12 @@ with tab2:
     fig = px.bar(top_centers.reset_index(), x="CENTER NAME", y="Total Birth Registrations",
                  title=f"Birth Registrations — Top {top_n} Centers", text_auto=True)
     fig.update_xaxes(tickangle=45)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     fig_nid = px.bar(top_centers.reset_index(), x="CENTER NAME", y="Total NID Registrations",
                       title=f"NID Registrations — Top {top_n} Centers", text_auto=True)
     fig_nid.update_xaxes(tickangle=45)
-    st.plotly_chart(fig_nid, use_container_width=True)
+    st.plotly_chart(fig_nid, width='stretch')
 
     st.dataframe(center_summary)
 
@@ -389,7 +389,7 @@ with tab3:
     if len(trend) > 1:
         fig = px.line(trend, x="Date", y=["Total Birth Registrations", "Total NID Registrations"], markers=True,
                       title="Birth & NID Registrations Over Time")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
     else:
         st.info("Only one date present in the current filter — trend chart will populate as more days are added.")
     st.dataframe(trend)
@@ -402,11 +402,11 @@ with tab4:
     ).reset_index()
     fig = px.bar(zone_mf_birth, x="ZONE NAME", y=["Male", "Female"], barmode="stack",
                  title="Birth Registrations by Zone — Male vs Female")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     overall_birth = pd.DataFrame({"Sex": ["Male", "Female"], "Count": [total_male_birth, total_female_birth]})
     fig_pie = px.pie(overall_birth, names="Sex", values="Count", title="Overall Birth Registration Male/Female Split")
-    st.plotly_chart(fig_pie, use_container_width=True)
+    st.plotly_chart(fig_pie, width='stretch')
 
     st.markdown("**NID Registration — Male vs Female**")
     zone_mf_nid = filtered.groupby("ZONE NAME").agg(
@@ -415,11 +415,11 @@ with tab4:
     ).reset_index()
     fig2 = px.bar(zone_mf_nid, x="ZONE NAME", y=["Male", "Female"], barmode="stack",
                   title="NID Registrations by Zone — Male vs Female")
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width='stretch')
 
     overall_nid = pd.DataFrame({"Sex": ["Male", "Female"], "Count": [total_male_nid, total_female_nid]})
     fig_pie2 = px.pie(overall_nid, names="Sex", values="Count", title="Overall NID Registration Male/Female Split")
-    st.plotly_chart(fig_pie2, use_container_width=True)
+    st.plotly_chart(fig_pie2, width='stretch')
 
 st.divider()
 
