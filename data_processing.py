@@ -3,8 +3,12 @@ Data cleaning and processing for NRBC daily reporting form data.
 """
 import re
 import difflib
+import json
+import os
 import pandas as pd
 import numpy as np
+
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 
 RAW_COLUMNS = [
     "Timestamp", "ZONE NAME", "CENTER NAME", "Date",
@@ -16,6 +20,40 @@ NUMERIC_COLS = [
     "Total Male Births Registered", "Total Female Births Registered",
     "Total Males Processed", "Total Females Processed",
 ]
+
+
+def load_saved_merges() -> dict:
+    """Load previously-confirmed zone/center name corrections from config.json,
+    so they apply for every session (viewers included) and survive app restarts,
+    instead of only lasting for one admin's browser tab."""
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                data = json.load(f)
+                merges = data.get("confirmed_merges", {"zone": {}, "center": {}})
+                # defensive defaults in case of a partially-written file
+                merges.setdefault("zone", {})
+                merges.setdefault("center", {})
+                return merges
+        except Exception:
+            pass
+    return {"zone": {}, "center": {}}
+
+
+def save_merges(merges: dict) -> None:
+    data = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    data["confirmed_merges"] = merges
+    try:
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass  # non-fatal if we can't persist, e.g. read-only filesystem
 
 
 def normalize_text(s):

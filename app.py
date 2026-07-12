@@ -3,7 +3,10 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-from data_processing import load_raw, clean_data, find_fuzzy_suggestions, prepare_raw_columns
+from data_processing import (
+    load_raw, clean_data, find_fuzzy_suggestions, prepare_raw_columns,
+    load_saved_merges, save_merges,
+)
 from report_generator import build_report
 from google_sheets import fetch_google_sheet, load_saved_url, save_url
 from column_mapping import (
@@ -19,15 +22,15 @@ st.set_page_config(page_title="NID & NRBC Daily Reporting Dashboard", layout="wi
 st.title("🧾 NID & NRBC Daily Reporting Dashboard")
 st.caption(
     "Note: Birth Registration and National ID (NID) Registration are "
-    "two separate activities captured on the same form — they're tracked "
-    "side-by-side below, not as a before/after pipeline."
+    "two separate activities captured on the same form - they're tracked "
+    "side-by-side below."
 )
 
 # ------------------------------------------------------------------
 # Session state init
 # ------------------------------------------------------------------
 if "confirmed_merges" not in st.session_state:
-    st.session_state.confirmed_merges = {"zone": {}, "center": {}}
+    st.session_state.confirmed_merges = load_saved_merges()
 if "sheet_refresh_token" not in st.session_state:
     st.session_state.sheet_refresh_token = 0
 if "is_admin" not in st.session_state:
@@ -275,6 +278,7 @@ with st.expander("🔍 Data Quality Review", expanded=False):
                 st.session_state.confirmed_merges["center"].pop(s["b"], None)
 
         if st.button("Apply confirmed merges"):
+            save_merges(st.session_state.confirmed_merges)
             st.rerun()
 
     st.subheader("Master Reference Check")
@@ -296,18 +300,25 @@ with st.expander("🔍 Data Quality Review", expanded=False):
             typo_issues = [i for i in master_issues if i["issue"] in ("zone_typo", "center_typo")]
             if typo_issues:
                 st.write("**Quick-fix spelling typos** (safe to auto-correct — just renames the field):")
+                # Dedupe: the same wrong zone/center value can appear across multiple
+                # submitted rows (paired with different centers/zones each time), but
+                # the fix is the same regardless — one button per unique (field, wrong_value).
+                seen = {}
                 for i in typo_issues:
-                    # extract the suggested correct value from the message (after "Closest match: '")
                     m = re.search(r"Closest match: '([^']+)'", i["suggestion"])
                     if not m:
                         continue
                     correct_value = m.group(1)
                     field = "zone" if i["issue"] == "zone_typo" else "center"
                     wrong_value = i["zone"] if field == "zone" else i["center"]
+                    seen[(field, wrong_value)] = correct_value
+
+                for (field, wrong_value), correct_value in seen.items():
                     c1, c2 = st.columns([3, 1])
                     c1.write(f"'{wrong_value}' → '{correct_value}'")
                     if c2.button("Fix", key=f"masterfix_{field}_{wrong_value}"):
                         st.session_state.confirmed_merges[field][wrong_value] = correct_value
+                        save_merges(st.session_state.confirmed_merges)
                         st.rerun()
             swap_issues = [i for i in master_issues if i["issue"] in ("zone_center_swap", "wrong_zone_for_center", "unknown")]
             if swap_issues:

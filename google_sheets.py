@@ -62,8 +62,16 @@ def load_saved_url() -> str:
 
 
 def save_url(url: str) -> None:
+    data = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    data["google_sheet_url"] = url
     try:
         with open(CONFIG_PATH, "w") as f:
-            json.dump({"google_sheet_url": url}, f)
+            json.dump(data, f)
     except Exception:
         pass  # non-fatal if we can't persist, e.g. read-only filesystem
