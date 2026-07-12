@@ -2,13 +2,8 @@
 Data cleaning and processing for NRBC daily reporting form data.
 """
 import re
-import difflib
-import json
-import os
 import pandas as pd
 import numpy as np
-
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 
 RAW_COLUMNS = [
     "Timestamp", "ZONE NAME", "CENTER NAME", "Date",
@@ -20,40 +15,6 @@ NUMERIC_COLS = [
     "Total Male Births Registered", "Total Female Births Registered",
     "Total Males Processed", "Total Females Processed",
 ]
-
-
-def load_saved_merges() -> dict:
-    """Load previously-confirmed zone/center name corrections from config.json,
-    so they apply for every session (viewers included) and survive app restarts,
-    instead of only lasting for one admin's browser tab."""
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH) as f:
-                data = json.load(f)
-                merges = data.get("confirmed_merges", {"zone": {}, "center": {}})
-                # defensive defaults in case of a partially-written file
-                merges.setdefault("zone", {})
-                merges.setdefault("center", {})
-                return merges
-        except Exception:
-            pass
-    return {"zone": {}, "center": {}}
-
-
-def save_merges(merges: dict) -> None:
-    data = {}
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH) as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-    data["confirmed_merges"] = merges
-    try:
-        with open(CONFIG_PATH, "w") as f:
-            json.dump(data, f)
-    except Exception:
-        pass  # non-fatal if we can't persist, e.g. read-only filesystem
 
 
 def normalize_text(s):
@@ -80,24 +41,31 @@ def load_raw(file) -> pd.DataFrame:
     return prepare_raw_columns(df)
 
 
-def clean_data(df: pd.DataFrame, confirmed_merges: dict = None):
+def clean_data(df: pd.DataFrame):
     """
-    Clean the raw dataframe.
+    Clean the raw dataframe: parse dates, normalize zone/center text casing,
+    coerce numeric fields, flag data-quality issues, dedupe.
 
-    confirmed_merges: optional dict like {"zone": {"Bqengu": "Bwengu"}, "center": {...}}
-    used to apply user-confirmed fuzzy-match merges on top of automatic whitespace/case cleanup.
+    Zone/center CORRECTION (typo fixes, zone/center swaps, mapping to the
+    predefined master list) is handled separately by master_reference.py's
+    apply_assignments(), applied by the caller after this function returns —
+    that keeps generic cleaning here decoupled from the campaign-specific
+    master reference list.
 
     Returns:
         cleaned_df: the cleaned dataframe
         report: dict with data-quality findings
     """
-    confirmed_merges = confirmed_merges or {"zone": {}, "center": {}}
     report = {}
     df = df.copy()
 
     # --- 1. Parse dates ---
-    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    # dayfirst=True: this data uses DD/MM/YYYY (Malawi convention). Without this,
+    # pandas' per-value format guessing silently misreads e.g. "08/07/2026"
+    # (8th July) as month=08 day=07 (7th August) for any day-of-month <= 12,
+    # scattering rows across the wrong months.
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce", dayfirst=True)
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", dayfirst=True)
 
     bad_dates = df[df["Date"].isna() | df["Timestamp"].isna()]
     report["bad_dates"] = bad_dates
@@ -113,22 +81,15 @@ def clean_data(df: pd.DataFrame, confirmed_merges: dict = None):
     # frequent original casing as the display form
     def canonicalize(series):
         key = series.str.upper()
-        # for each key, find most common surface form
         mapping = {}
         for k, grp in series.groupby(key):
             mapping[k] = grp.value_counts().idxmax()
-        return key.map(mapping), key
+        return key.map(mapping)
 
-    df["ZONE NAME"], zone_key = canonicalize(df["ZONE NAME"])
-    df["CENTER NAME"], center_key = canonicalize(df["CENTER NAME"])
+    df["ZONE NAME"] = canonicalize(df["ZONE NAME"])
+    df["CENTER NAME"] = canonicalize(df["CENTER NAME"])
 
-    # --- 3. Apply confirmed fuzzy merges (user-approved typo corrections) ---
-    for wrong, right in confirmed_merges.get("zone", {}).items():
-        df.loc[df["ZONE NAME"].str.upper() == wrong.upper(), "ZONE NAME"] = right
-    for wrong, right in confirmed_merges.get("center", {}).items():
-        df.loc[df["CENTER NAME"].str.upper() == wrong.upper(), "CENTER NAME"] = right
-
-    # --- 4. Numeric coercion ---
+    # --- 3. Numeric coercion ---
     numeric_issues = {}
     for col in NUMERIC_COLS:
         original = df[col]
@@ -156,7 +117,7 @@ def clean_data(df: pd.DataFrame, confirmed_merges: dict = None):
     report["missing_numeric_rows"] = df[missing_numeric_mask]
     df[NUMERIC_COLS] = df[NUMERIC_COLS].fillna(0)
 
-    # --- 5. Exact duplicates: same zone/center/date/numbers -> keep latest by Timestamp ---
+    # --- 4. Exact duplicates: same zone/center/date/numbers -> keep latest by Timestamp ---
     dup_subset = ["ZONE NAME", "CENTER NAME", "Date"] + NUMERIC_COLS
     is_dup = df.duplicated(subset=dup_subset, keep=False)
     dup_rows = df[is_dup].sort_values(["ZONE NAME", "CENTER NAME", "Timestamp"])
@@ -167,7 +128,7 @@ def clean_data(df: pd.DataFrame, confirmed_merges: dict = None):
     report["duplicates_removed_count"] = len(df) - len(df_deduped)
     df = df_deduped
 
-    # --- 6. Derived columns ---
+    # --- 5. Derived columns ---
     # Note: Birth Registration and NID Registration are two SEPARATE activities
     # captured on the same daily form (not a before/after pipeline), so we track
     # them as independent totals rather than computing a "processing rate".
@@ -177,25 +138,3 @@ def clean_data(df: pd.DataFrame, confirmed_merges: dict = None):
     df = df.sort_values("Date").reset_index(drop=True)
 
     return df, report
-
-
-def find_fuzzy_suggestions(df: pd.DataFrame, column: str, cutoff: float = 0.75):
-    """
-    Suggest possible typo groupings within a column (e.g. Zone or Center names)
-    that are NOT already identical after whitespace/case normalization.
-    Returns a list of dicts: {"a": name1, "b": name2, "score": similarity}
-    """
-    names = sorted(df[column].dropna().unique().tolist())
-    suggestions = []
-    seen_pairs = set()
-    for i, name in enumerate(names):
-        matches = difflib.get_close_matches(name, names[i + 1:], n=3, cutoff=cutoff)
-        for m in matches:
-            pair = tuple(sorted([name, m]))
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-            score = difflib.SequenceMatcher(None, name, m).ratio()
-            suggestions.append({"a": pair[0], "b": pair[1], "score": round(score, 3)})
-    suggestions.sort(key=lambda x: -x["score"])
-    return suggestions

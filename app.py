@@ -1,12 +1,10 @@
 import re
+from datetime import date
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-from data_processing import (
-    load_raw, clean_data, find_fuzzy_suggestions, prepare_raw_columns,
-    load_saved_merges, save_merges,
-)
+from data_processing import load_raw, clean_data, prepare_raw_columns
 from report_generator import build_report
 from google_sheets import fetch_google_sheet, load_saved_url, save_url
 from column_mapping import (
@@ -14,23 +12,25 @@ from column_mapping import (
 )
 from auth import verify_pin, set_pin, is_default_pin_active
 from master_reference import (
-    load_master, check_submissions_against_master, reporting_status,
-    center_completion, centers_never_reported
+    load_master, find_unassigned, load_assignments, save_assignment,
+    apply_assignments, zone_center_matrix
 )
+
+# The activity's fixed date range — update here if the campaign's dates change.
+ACTIVITY_START_DATE = date(2026, 7, 8)
+ACTIVITY_END_DATE = date(2026, 7, 18)
 
 st.set_page_config(page_title="NID & NRBC Daily Reporting Dashboard", layout="wide")
 st.title("🧾 NID & NRBC Daily Reporting Dashboard")
 st.caption(
     "Note: Birth Registration and National ID (NID) Registration are "
-    "two separate activities captured on the same form - they're tracked "
-    "side-by-side below."
+    "two separate activities captured on the same form — they're tracked "
+    "side-by-side below, not as a before/after pipeline."
 )
 
 # ------------------------------------------------------------------
 # Session state init
 # ------------------------------------------------------------------
-if "confirmed_merges" not in st.session_state:
-    st.session_state.confirmed_merges = load_saved_merges()
 if "sheet_refresh_token" not in st.session_state:
     st.session_state.sheet_refresh_token = 0
 if "is_admin" not in st.session_state:
@@ -68,9 +68,6 @@ is_admin = st.session_state.is_admin
 
 # ------------------------------------------------------------------
 # Data source: Google Sheet (live) or manual upload
-# Admins configure the connection; everyone else just gets the data it
-# already points to, read-only, so viewers can't interfere with the link
-# or accidentally trigger uploads.
 # ------------------------------------------------------------------
 raw_df = None
 saved_url = load_saved_url()
@@ -118,7 +115,6 @@ if is_admin:
             raw_df = load_raw(uploaded_file)
 
 else:
-    # Viewer path: silently use whatever the admin has already connected.
     if saved_url:
         @st.cache_data(ttl=300, show_spinner="Loading latest data...")
         def _cached_fetch_viewer(url):
@@ -136,10 +132,7 @@ if raw_df is None:
     st.stop()
 
 # ------------------------------------------------------------------
-# Column mapping — makes the app resilient to header drift (renamed columns,
-# reordered columns, minor wording changes) instead of requiring exact names.
-# This is part of the data connection setup, so it's admin-only; viewers rely
-# on whatever mapping has already been confirmed and saved.
+# Column mapping — resilient to header drift (renamed/reordered columns)
 # ------------------------------------------------------------------
 raw_headers = list(raw_df.columns)
 saved_mapping = load_saved_mapping()
@@ -200,11 +193,18 @@ if missing_required:
     st.stop()
 
 raw_df = apply_mapping(raw_df, mapping)
-cleaned_df, report = clean_data(raw_df, st.session_state.confirmed_merges)
+cleaned_df, report = clean_data(raw_df)
 
 # ------------------------------------------------------------------
-# Data quality review panel — informational parts stay visible to everyone;
-# the merge controls (which edit the data) are admin-only.
+# Master reference: apply any admin-confirmed (zone, center) assignments,
+# so every corrected submission counts under its predefined zone/center.
+# ------------------------------------------------------------------
+master_df = load_master()
+assignments = load_assignments()
+cleaned_df = apply_assignments(cleaned_df, assignments)
+
+# ------------------------------------------------------------------
+# Data quality review panel
 # ------------------------------------------------------------------
 with st.expander("🔍 Data Quality Review", expanded=False):
     st.write(f"**Duplicate rows auto-removed (kept latest by timestamp):** {report['duplicates_removed_count']}")
@@ -232,104 +232,44 @@ with st.expander("🔍 Data Quality Review", expanded=False):
             "errors and are worth checking with the reporting center."
         )
         st.dataframe(report["non_integer_rows"][
-            ["ZONE NAME", "CENTER NAME", "Date"] + [
-                c for c in ["Total Male Births Registered", "Total Female Births Registered",
-                            "Total Males Processed", "Total Females Processed"]
-            ]
+            [c for c in DIAG_COLS if c in report["non_integer_rows"].columns]
         ])
 
-    if is_admin:
-        st.subheader("Possible Zone Name Typos")
-        zone_suggestions = find_fuzzy_suggestions(cleaned_df, "ZONE NAME")
-        if not zone_suggestions:
-            st.write("No suspected typos found among zone names.")
-        for s in zone_suggestions:
-            c1, c2, c3 = st.columns([3, 1, 2])
-            c1.write(f"**{s['a']}**  ↔  **{s['b']}**  (similarity {s['score']})")
-            choice = c2.radio(
-                "Merge?", ["Keep separate", f"{s['a']} → {s['b']}", f"{s['b']} → {s['a']}"],
-                key=f"zone_{s['a']}_{s['b']}", label_visibility="collapsed"
-            )
-            if choice == f"{s['a']} → {s['b']}":
-                st.session_state.confirmed_merges["zone"][s["a"]] = s["b"]
-            elif choice == f"{s['b']} → {s['a']}":
-                st.session_state.confirmed_merges["zone"][s["b"]] = s["a"]
-            else:
-                st.session_state.confirmed_merges["zone"].pop(s["a"], None)
-                st.session_state.confirmed_merges["zone"].pop(s["b"], None)
-
-        st.subheader("Possible Center Name Typos")
-        center_suggestions = find_fuzzy_suggestions(cleaned_df, "CENTER NAME")
-        if not center_suggestions:
-            st.write("No suspected typos found among center names.")
-        for s in center_suggestions:
-            c1, c2, c3 = st.columns([3, 1, 2])
-            c1.write(f"**{s['a']}**  ↔  **{s['b']}**  (similarity {s['score']})")
-            choice = c2.radio(
-                "Merge?", ["Keep separate", f"{s['a']} → {s['b']}", f"{s['b']} → {s['a']}"],
-                key=f"center_{s['a']}_{s['b']}", label_visibility="collapsed"
-            )
-            if choice == f"{s['a']} → {s['b']}":
-                st.session_state.confirmed_merges["center"][s["a"]] = s["b"]
-            elif choice == f"{s['b']} → {s['a']}":
-                st.session_state.confirmed_merges["center"][s["b"]] = s["a"]
-            else:
-                st.session_state.confirmed_merges["center"].pop(s["a"], None)
-                st.session_state.confirmed_merges["center"].pop(s["b"], None)
-
-        if st.button("Apply confirmed merges"):
-            save_merges(st.session_state.confirmed_merges)
-            st.rerun()
-
-    st.subheader("Master Reference Check")
+    st.subheader("Zone/Center Assignment")
     st.caption(
-        "Compares submitted zone/center names against the official campaign "
-        "registry (from the NR8-A forms allocation list) — this is the "
-        "authoritative source of correct spellings, not just internal guesswork."
+        "Every submission should map to one of the predefined zones/centers "
+        "from the official campaign registry. Anything that doesn't is listed "
+        "below and needs an admin to assign it to the correct zone/center."
     )
-    master_df = load_master()
-    master_issues = check_submissions_against_master(cleaned_df, master_df)
-    if not master_issues:
+    unassigned = find_unassigned(cleaned_df, master_df)
+    if not unassigned:
         st.write("All submitted zone/center combinations match the master reference. ✅")
     else:
-        st.warning(f"{len(master_issues)} submitted zone/center combination(s) don't match the master reference.")
-        issues_df = pd.DataFrame(master_issues)
-        st.dataframe(issues_df[["zone", "center", "issue", "suggestion"]])
-
+        st.warning(f"{len(unassigned)} submitted zone/center combination(s) need assignment.")
         if is_admin:
-            typo_issues = [i for i in master_issues if i["issue"] in ("zone_typo", "center_typo")]
-            if typo_issues:
-                st.write("**Quick-fix spelling typos** (safe to auto-correct — just renames the field):")
-                # Dedupe: the same wrong zone/center value can appear across multiple
-                # submitted rows (paired with different centers/zones each time), but
-                # the fix is the same regardless — one button per unique (field, wrong_value).
-                seen = {}
-                for i in typo_issues:
-                    m = re.search(r"Closest match: '([^']+)'", i["suggestion"])
-                    if not m:
-                        continue
-                    correct_value = m.group(1)
-                    field = "zone" if i["issue"] == "zone_typo" else "center"
-                    wrong_value = i["zone"] if field == "zone" else i["center"]
-                    seen[(field, wrong_value)] = correct_value
-
-                for (field, wrong_value), correct_value in seen.items():
-                    c1, c2 = st.columns([3, 1])
-                    c1.write(f"'{wrong_value}' → '{correct_value}'")
-                    if c2.button("Fix", key=f"masterfix_{field}_{wrong_value}"):
-                        st.session_state.confirmed_merges[field][wrong_value] = correct_value
-                        save_merges(st.session_state.confirmed_merges)
-                        st.rerun()
-            swap_issues = [i for i in master_issues if i["issue"] in ("zone_center_swap", "wrong_zone_for_center", "unknown")]
-            if swap_issues:
-                st.info(
-                    "Zone/center mix-ups and unrecognized names need manual review — "
-                    "they can't be safely auto-corrected since fixing them may mean moving "
-                    "a value between fields, not just renaming it."
+            zone_options = sorted(master_df["Zone"].unique())
+            for u in unassigned:
+                st.markdown(f"**'{u['zone']}' / '{u['center']}'** — {u['suggestion']}")
+                c1, c2, c3 = st.columns([2, 2, 1])
+                default_zone_idx = zone_options.index(u["suggested_zone"]) if u["suggested_zone"] in zone_options else 0
+                chosen_zone = c1.selectbox("Zone", zone_options, index=default_zone_idx,
+                                            key=f"assign_zone_{u['zone']}_{u['center']}")
+                center_options = sorted(master_df.loc[master_df["Zone"] == chosen_zone, "Center"].unique())
+                default_center_idx = (
+                    center_options.index(u["suggested_center"])
+                    if u["suggested_center"] in center_options else 0
                 )
+                chosen_center = c2.selectbox("Center", center_options, index=default_center_idx,
+                                              key=f"assign_center_{u['zone']}_{u['center']}")
+                if c3.button("Assign", key=f"assign_btn_{u['zone']}_{u['center']}"):
+                    save_assignment(u["zone"], u["center"], chosen_zone, chosen_center)
+                    st.rerun()
+        else:
+            issues_df = pd.DataFrame(unassigned)
+            st.dataframe(issues_df[["zone", "center", "issue", "suggestion"]])
 
 # ------------------------------------------------------------------
-# Sidebar filters — available to everyone, viewing only
+# Sidebar filters
 # ------------------------------------------------------------------
 st.sidebar.header("Filters")
 zones = sorted(cleaned_df["ZONE NAME"].unique())
@@ -358,7 +298,7 @@ if filtered.empty:
     st.stop()
 
 # ------------------------------------------------------------------
-# KPIs — two independent activities, reported side by side
+# KPIs
 # ------------------------------------------------------------------
 total_birth = int(filtered["Total Birth Registrations"].sum())
 total_male_birth = int(filtered["Total Male Births Registered"].sum())
@@ -412,7 +352,7 @@ center_summary.columns = [
 ]
 
 # ------------------------------------------------------------------
-# Charts — visible to everyone
+# Charts
 # ------------------------------------------------------------------
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
     ["By Zone", "By Center", "Trend Over Time", "Male vs Female", "Reporting Status"]
@@ -423,7 +363,8 @@ with tab1:
                  title="Birth Registrations by Zone", text_auto=True)
     st.plotly_chart(fig, width='stretch')
 
-    fig_nid = px.bar(zone_summary.reset_index(), x="ZONE NAME", y="Total NID Registrations",
+    nid_sorted = zone_summary.reset_index().sort_values("Total NID Registrations", ascending=False)
+    fig_nid = px.bar(nid_sorted, x="ZONE NAME", y="Total NID Registrations",
                       title="NID Registrations by Zone", text_auto=True)
     st.plotly_chart(fig_nid, width='stretch')
 
@@ -437,7 +378,8 @@ with tab2:
     fig.update_xaxes(tickangle=45)
     st.plotly_chart(fig, width='stretch')
 
-    fig_nid = px.bar(top_centers.reset_index(), x="CENTER NAME", y="Total NID Registrations",
+    nid_top_sorted = center_summary.reset_index().sort_values("Total NID Registrations", ascending=False).head(top_n)
+    fig_nid = px.bar(nid_top_sorted, x="CENTER NAME", y="Total NID Registrations",
                       title=f"NID Registrations — Top {top_n} Centers", text_auto=True)
     fig_nid.update_xaxes(tickangle=45)
     st.plotly_chart(fig_nid, width='stretch')
@@ -450,9 +392,13 @@ with tab3:
         Total_NID_Registrations=("Total NID Registrations", "sum"),
     ).reset_index()
     trend.columns = ["Date", "Total Birth Registrations", "Total NID Registrations"]
+    trend = trend.sort_values("Date")
     if len(trend) > 1:
         fig = px.line(trend, x="Date", y=["Total Birth Registrations", "Total NID Registrations"], markers=True,
                       title="Birth & NID Registrations Over Time")
+        # Same month throughout the activity — show day-of-month, not month names,
+        # and force one tick per actual day so it can't be misread as spanning months.
+        fig.update_xaxes(tickformat="%d %b", dtick="D1")
         st.plotly_chart(fig, width='stretch')
     else:
         st.info("Only one date present in the current filter — trend chart will populate as more days are added.")
@@ -464,6 +410,8 @@ with tab4:
         Male=("Total Male Births Registered", "sum"),
         Female=("Total Female Births Registered", "sum"),
     ).reset_index()
+    zone_mf_birth["Total"] = zone_mf_birth["Male"] + zone_mf_birth["Female"]
+    zone_mf_birth = zone_mf_birth.sort_values("Total", ascending=False)
     fig = px.bar(zone_mf_birth, x="ZONE NAME", y=["Male", "Female"], barmode="stack",
                  title="Birth Registrations by Zone — Male vs Female")
     st.plotly_chart(fig, width='stretch')
@@ -477,6 +425,8 @@ with tab4:
         Male=("Total Males Processed", "sum"),
         Female=("Total Females Processed", "sum"),
     ).reset_index()
+    zone_mf_nid["Total"] = zone_mf_nid["Male"] + zone_mf_nid["Female"]
+    zone_mf_nid = zone_mf_nid.sort_values("Total", ascending=False)
     fig2 = px.bar(zone_mf_nid, x="ZONE NAME", y=["Male", "Female"], barmode="stack",
                   title="NID Registrations by Zone — Male vs Female")
     st.plotly_chart(fig2, width='stretch')
@@ -486,87 +436,25 @@ with tab4:
     st.plotly_chart(fig_pie2, width='stretch')
 
 with tab5:
-    st.markdown(
-        "Tracks which zones/centers **haven't submitted a report yet**, against the "
-        "official master list of all campaign centers — spanning the activity's date "
-        "range. This uses all submitted data regardless of the sidebar filters above; "
-        "the sidebar Zone filter narrows which centers are checked."
-    )
-    master_df = load_master()
-    if selected_zones and set(selected_zones) != set(zones):
-        master_df_scope = master_df[master_df["Zone"].str.upper().isin([z.upper() for z in selected_zones])]
-    else:
-        master_df_scope = master_df
-
-    today = pd.Timestamp.now().date()
-    data_min = cleaned_df["Date"].min().date()
-    data_max = cleaned_df["Date"].max().date()
-    range_upper_bound = max(data_max, today)
-
-    status_range = st.date_input(
-        "Activity date range to check",
-        value=(data_min, data_max),
-        min_value=data_min,
-        max_value=range_upper_bound,
-        key="reporting_status_range",
-    )
-    if isinstance(status_range, tuple) and len(status_range) == 2:
-        status_start, status_end = status_range
-    else:
-        status_start, status_end = data_min, data_max
-
-    daily_summary, missing_by_date = reporting_status(cleaned_df, master_df_scope, status_start, status_end)
-
-    st.subheader("Daily completion")
-    if len(daily_summary) > 1:
-        fig_completion = px.line(daily_summary, x="Date", y="Pct Complete", markers=True,
-                                  title="% of Centers Reported, by Day")
-        fig_completion.update_yaxes(range=[0, 100])
-        st.plotly_chart(fig_completion, width='stretch')
-    st.dataframe(daily_summary)
-
-    st.subheader("Missing reports for a specific day")
-    available_dates = list(daily_summary["Date"])
-    if available_dates:
-        picked_date = st.selectbox("Choose a date", available_dates, index=len(available_dates) - 1)
-        missing_today = missing_by_date.get(picked_date, [])
-        if not missing_today:
-            st.success(f"All {len(master_df_scope[['Zone','Center']].drop_duplicates())} centers reported on {picked_date}. ✅")
-        else:
-            st.warning(f"{len(missing_today)} center(s) have not reported for {picked_date}.")
-            missing_df = pd.DataFrame(missing_today, columns=["Zone", "Center"]).sort_values(["Zone", "Center"])
-            st.dataframe(missing_df)
-
-    st.subheader(f"Center completion ({status_start} to {status_end})")
     st.caption(
-        "How consistently each center has been reporting — days actually reported "
-        "out of every day in the selected range, same denominator for all centers."
+        f"Activity runs {ACTIVITY_START_DATE.strftime('%d %b')} to {ACTIVITY_END_DATE.strftime('%d %b %Y')}. "
+        "Pick a zone to see each of its centers' submissions for every day of the activity."
     )
-    completion = center_completion(cleaned_df, master_df_scope, status_start, status_end)
-    n_full = int((completion["Completion %"] == 100).sum())
-    n_partial = int(((completion["Completion %"] > 0) & (completion["Completion %"] < 100)).sum())
-    n_zero = int((completion["Completion %"] == 0).sum())
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Fully reporting (100%)", n_full)
-    c2.metric("Partially reporting", n_partial)
-    c3.metric("Zero reports", n_zero)
+    zone_options_5 = sorted(master_df["Zone"].unique())
+    picked_zone = st.selectbox("Zone", zone_options_5, key="reporting_status_zone")
+
+    matrix = zone_center_matrix(cleaned_df, master_df, picked_zone, ACTIVITY_START_DATE, ACTIVITY_END_DATE)
+    day_cols = [c for c in matrix.columns if c != "Center"]
+    total_expected = len(matrix) * len(day_cols)
+    total_submitted = int((matrix[day_cols] > 0).sum().sum())
+    st.metric(f"Reports submitted in {picked_zone}", f"{total_submitted} / {total_expected}")
     st.dataframe(
-        completion,
+        matrix,
         hide_index=True,
         column_config={
-            "Completion %": st.column_config.ProgressColumn(
-                "Completion %", min_value=0, max_value=100, format="%.0f%%"
-            )
+            c: st.column_config.NumberColumn(c, format="%d") for c in day_cols
         },
     )
-
-    st.subheader(f"Centers with zero reports in this range ({status_start} to {status_end})")
-    never = centers_never_reported(cleaned_df, master_df_scope, status_start, status_end)
-    if never.empty:
-        st.success("Every center in scope has reported at least once in this range. ✅")
-    else:
-        st.warning(f"{len(never)} center(s) have not reported at all in this range.")
-        st.dataframe(never)
 
 st.divider()
 
