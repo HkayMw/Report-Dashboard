@@ -2,6 +2,7 @@
 Data cleaning and processing for NRBC daily reporting form data.
 """
 import re
+from datetime import date
 import pandas as pd
 import numpy as np
 
@@ -15,6 +16,37 @@ NUMERIC_COLS = [
     "Total Male Births Registered", "Total Female Births Registered",
     "Total Males Processed", "Total Females Processed",
 ]
+
+# The activity's fixed date range — single source of truth, also used by
+# app.py's Reporting Status tab and by the date-correction heuristic below.
+# Update here if the campaign's dates change.
+ACTIVITY_START_DATE = date(2026, 7, 8)
+ACTIVITY_END_DATE = date(2026, 7, 18)
+
+
+def _fix_swapped_day_month(dt_series: pd.Series, valid_start: date, valid_end: date) -> pd.Series:
+    """
+    If a parsed date falls outside [valid_start, valid_end], but swapping its
+    day and month would bring it inside that range, assume the day/month got
+    transposed upstream — e.g. Google Sheets auto-converting a DD/MM-typed
+    date using a US MM/DD locale — and correct it. Leaves the time-of-day
+    component untouched. Dates that don't fall into range either way are left
+    as-is (they'll surface via the existing bad-date / out-of-range checks).
+    """
+    def fix_one(ts):
+        if pd.isna(ts):
+            return ts
+        d = ts.date()
+        if valid_start <= d <= valid_end:
+            return ts
+        try:
+            swapped = ts.replace(day=ts.month, month=ts.day)
+        except ValueError:
+            return ts  # e.g. original day > 12, can't be a valid month
+        if valid_start <= swapped.date() <= valid_end:
+            return swapped
+        return ts
+    return dt_series.apply(fix_one)
 
 
 def normalize_text(s):
@@ -64,8 +96,25 @@ def clean_data(df: pd.DataFrame):
     # pandas' per-value format guessing silently misreads e.g. "08/07/2026"
     # (8th July) as month=08 day=07 (7th August) for any day-of-month <= 12,
     # scattering rows across the wrong months.
-    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce", dayfirst=True)
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", dayfirst=True)
+    # Google Sheets' CSV export gives dates in unambiguous ISO format
+    # (YYYY-MM-DD), so no dayfirst disambiguation is needed — in fact
+    # dayfirst=True actively misparses ISO strings when the day is <=12
+    # (a genuine pandas quirk), so it's deliberately NOT used here. Any
+    # day/month corruption that happens upstream of this (e.g. a spreadsheet
+    # locale mismatch) is instead caught by the swap-correction heuristic below.
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+
+    # Catch dates that arrived already-corrupted upstream (e.g. a spreadsheet
+    # locale mismatch), which dayfirst=True can't fix since ISO-formatted
+    # strings have no ambiguity left to resolve at parse time.
+    pre_fix_date = df["Date"].copy()
+    df["Date"] = _fix_swapped_day_month(df["Date"], ACTIVITY_START_DATE, ACTIVITY_END_DATE)
+    df["Timestamp"] = _fix_swapped_day_month(df["Timestamp"], ACTIVITY_START_DATE, ACTIVITY_END_DATE)
+    date_corrected_mask = (df["Date"] != pre_fix_date) & df["Date"].notna() & pre_fix_date.notna()
+    report["date_corrected_rows"] = df.loc[
+        date_corrected_mask, ["ZONE NAME", "CENTER NAME"]
+    ].assign(**{"Original Date": pre_fix_date[date_corrected_mask].dt.date, "Corrected Date": df.loc[date_corrected_mask, "Date"].dt.date})
 
     bad_dates = df[df["Date"].isna() | df["Timestamp"].isna()]
     report["bad_dates"] = bad_dates

@@ -1,10 +1,9 @@
 import re
-from datetime import date
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-from data_processing import load_raw, clean_data, prepare_raw_columns
+from data_processing import load_raw, clean_data, prepare_raw_columns, ACTIVITY_START_DATE, ACTIVITY_END_DATE
 from report_generator import build_report
 from google_sheets import fetch_google_sheet, load_saved_url, save_url
 from column_mapping import (
@@ -12,13 +11,12 @@ from column_mapping import (
 )
 from auth import verify_pin, set_pin, is_default_pin_active
 from master_reference import (
-    load_master, find_unassigned, load_assignments, save_assignment,
-    apply_assignments, zone_center_matrix
+    load_master, zone_center_matrix,
+    find_unmatched_zones, save_zone_assignment, load_zone_assignments, apply_zone_assignments,
+    find_unmatched_centers, save_center_assignment, load_center_assignments, apply_center_assignments,
 )
 
-# The activity's fixed date range — update here if the campaign's dates change.
-ACTIVITY_START_DATE = date(2026, 7, 8)
-ACTIVITY_END_DATE = date(2026, 7, 18)
+# Activity date range is defined once in data_processing.py (single source of truth)
 
 st.set_page_config(page_title="NID & NRBC Daily Reporting Dashboard", layout="wide")
 st.title("🧾 NID & NRBC Daily Reporting Dashboard")
@@ -196,12 +194,15 @@ raw_df = apply_mapping(raw_df, mapping)
 cleaned_df, report = clean_data(raw_df)
 
 # ------------------------------------------------------------------
-# Master reference: apply any admin-confirmed (zone, center) assignments,
-# so every corrected submission counts under its predefined zone/center.
+# Master reference: apply any admin-confirmed zone/center assignments, in
+# order — zone first, since center validation checks against the zone's
+# center list, so the zone needs to be correct first.
 # ------------------------------------------------------------------
 master_df = load_master()
-assignments = load_assignments()
-cleaned_df = apply_assignments(cleaned_df, assignments)
+zone_assignments = load_zone_assignments()
+cleaned_df = apply_zone_assignments(cleaned_df, zone_assignments)
+center_assignments = load_center_assignments()
+cleaned_df = apply_center_assignments(cleaned_df, center_assignments)
 
 # ------------------------------------------------------------------
 # Data quality review panel
@@ -235,38 +236,65 @@ with st.expander("🔍 Data Quality Review", expanded=False):
             [c for c in DIAG_COLS if c in report["non_integer_rows"].columns]
         ])
 
-    st.subheader("Zone/Center Assignment")
+    if len(report["date_corrected_rows"]):
+        st.info(
+            f"{len(report['date_corrected_rows'])} row(s) had a date outside the "
+            f"activity window ({ACTIVITY_START_DATE.strftime('%d %b')}–{ACTIVITY_END_DATE.strftime('%d %b')}) "
+            "that resolved correctly once day/month were swapped — auto-corrected. "
+            "This usually means a spreadsheet locale mismatch, not a data entry mistake."
+        )
+        st.dataframe(report["date_corrected_rows"])
+
+    st.subheader("Zone Assignment")
     st.caption(
-        "Every submission should map to one of the predefined zones/centers "
-        "from the official campaign registry. Anything that doesn't is listed "
-        "below and needs an admin to assign it to the correct zone/center."
+        "Submitted zone names that don't match any of the predefined zones "
+        "from the official campaign registry. Assign each to the correct zone."
     )
-    unassigned = find_unassigned(cleaned_df, master_df)
-    if not unassigned:
-        st.write("All submitted zone/center combinations match the master reference. ✅")
+    unmatched_zones = find_unmatched_zones(cleaned_df, master_df)
+    if not unmatched_zones:
+        st.write("All submitted zone names match the master reference. ✅")
     else:
-        st.warning(f"{len(unassigned)} submitted zone/center combination(s) need assignment.")
+        st.warning(f"{len(unmatched_zones)} submitted zone name(s) need assignment.")
         if is_admin:
             zone_options = sorted(master_df["Zone"].unique())
-            for u in unassigned:
-                st.markdown(f"**'{u['zone']}' / '{u['center']}'** — {u['suggestion']}")
+            for u in unmatched_zones:
                 c1, c2, c3 = st.columns([2, 2, 1])
-                default_zone_idx = zone_options.index(u["suggested_zone"]) if u["suggested_zone"] in zone_options else 0
-                chosen_zone = c1.selectbox("Zone", zone_options, index=default_zone_idx,
-                                            key=f"assign_zone_{u['zone']}_{u['center']}")
-                center_options = sorted(master_df.loc[master_df["Zone"] == chosen_zone, "Center"].unique())
-                default_center_idx = (
-                    center_options.index(u["suggested_center"])
-                    if u["suggested_center"] in center_options else 0
-                )
-                chosen_center = c2.selectbox("Center", center_options, index=default_center_idx,
-                                              key=f"assign_center_{u['zone']}_{u['center']}")
-                if c3.button("Assign", key=f"assign_btn_{u['zone']}_{u['center']}"):
-                    save_assignment(u["zone"], u["center"], chosen_zone, chosen_center)
+                c1.write(f"**'{u['zone']}'**")
+                default_idx = zone_options.index(u["suggested_zone"]) if u["suggested_zone"] in zone_options else 0
+                chosen = c2.selectbox("Correct zone", zone_options, index=default_idx,
+                                       key=f"zoneassign_{u['zone']}", label_visibility="collapsed")
+                if c3.button("Assign", key=f"zoneassign_btn_{u['zone']}"):
+                    save_zone_assignment(u["zone"], chosen)
                     st.rerun()
         else:
-            issues_df = pd.DataFrame(unassigned)
-            st.dataframe(issues_df[["zone", "center", "issue", "suggestion"]])
+            st.dataframe(pd.DataFrame(unmatched_zones))
+
+    st.subheader("Center Assignment")
+    st.caption(
+        "Submitted center names that don't match any known center under their "
+        "zone (only shown for zones that are already valid — fix Zone Assignment "
+        "above first if a zone is also wrong)."
+    )
+    unmatched_centers = find_unmatched_centers(cleaned_df, master_df)
+    if not unmatched_centers:
+        st.write("All submitted center names match the master reference. ✅")
+    else:
+        st.warning(f"{len(unmatched_centers)} submitted center name(s) need assignment.")
+        if is_admin:
+            for u in unmatched_centers:
+                center_options = sorted(master_df.loc[master_df["Zone"] == u["zone"], "Center"].unique())
+                if not center_options:
+                    continue
+                c1, c2, c3 = st.columns([2, 2, 1])
+                c1.write(f"**'{u['zone']}' / '{u['center']}'**")
+                default_idx = center_options.index(u["suggested_center"]) if u["suggested_center"] in center_options else 0
+                chosen = c2.selectbox("Correct center", center_options, index=default_idx,
+                                       key=f"centerassign_{u['zone']}_{u['center']}", label_visibility="collapsed")
+                if c3.button("Assign", key=f"centerassign_btn_{u['zone']}_{u['center']}"):
+                    save_center_assignment(u["zone"], u["center"], chosen)
+                    st.rerun()
+        else:
+            st.dataframe(pd.DataFrame(unmatched_centers))
 
 # ------------------------------------------------------------------
 # Sidebar filters
