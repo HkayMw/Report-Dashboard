@@ -51,6 +51,10 @@ def master_zone_set(master_df: pd.DataFrame) -> set:
     return set(master_df["Zone_norm"])
 
 
+def master_center_set(master_df: pd.DataFrame) -> set:
+    return set(master_df["Center_norm"])
+
+
 def centers_by_zone(master_df: pd.DataFrame) -> dict:
     d = {}
     for zone_norm, grp in master_df.groupby("Zone_norm"):
@@ -180,16 +184,19 @@ def apply_center_assignments(df: pd.DataFrame, center_assignments: list) -> pd.D
 
 def find_unmatched_centers(cleaned_df: pd.DataFrame, master_df: pd.DataFrame) -> list:
     """
-    Unique (zone, center) pairs where the ZONE already matches a known zone,
-    but the center doesn't match any center listed under it. Only checks rows
-    with a valid zone — fix zone assignment first, center issues for those
-    rows will naturally resurface afterward if still unresolved.
+    Unique (zone, center) pairs where the center doesn't match any known
+    center — checked independently of whether the zone itself is valid, so
+    center assignment isn't blocked by an unrelated zone issue. When the
+    submitted zone IS valid, matching/suggestions are scoped to that zone's
+    centers; when it isn't, they fall back to the full center list.
 
     Returns a list of dicts: zone, center, suggested_center (best guess, may be None).
     """
     zones = master_zone_set(master_df)
+    all_centers = master_center_set(master_df)
     by_zone = centers_by_zone(master_df)
     center_display = {(row["Zone_norm"], row["Center_norm"]): row["Center"] for _, row in master_df.iterrows()}
+    center_display_any = {row["Center_norm"]: row["Center"] for _, row in master_df.iterrows()}
 
     results = []
     pairs = cleaned_df[["ZONE NAME", "CENTER NAME"]].drop_duplicates()
@@ -197,19 +204,20 @@ def find_unmatched_centers(cleaned_df: pd.DataFrame, master_df: pd.DataFrame) ->
         zone, center = row["ZONE NAME"], row["CENTER NAME"]
         nz, nc = _normalize(zone), _normalize(center)
 
-        if nz not in zones:
-            continue  # zone itself needs fixing first
-        if nc in by_zone.get(nz, set()):
+        zone_is_valid = nz in zones
+        candidate_centers = by_zone.get(nz, set()) if zone_is_valid else all_centers
+
+        if nc in candidate_centers:
             continue
 
         suggested = None
         stripped_nc = _strip_suffix_noise(nc)
-        if stripped_nc != nc and stripped_nc in by_zone.get(nz, set()):
-            suggested = center_display.get((nz, stripped_nc))
+        if stripped_nc != nc and stripped_nc in candidate_centers:
+            suggested = center_display.get((nz, stripped_nc)) if zone_is_valid else center_display_any.get(stripped_nc)
         else:
-            m = difflib.get_close_matches(nc, by_zone.get(nz, set()), n=1, cutoff=0.5)
+            m = difflib.get_close_matches(nc, candidate_centers, n=1, cutoff=0.5)
             if m:
-                suggested = center_display.get((nz, m[0]))
+                suggested = center_display.get((nz, m[0])) if zone_is_valid else center_display_any.get(m[0])
 
         results.append({"zone": zone, "center": center, "suggested_center": suggested})
     return results

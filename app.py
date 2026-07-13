@@ -1,4 +1,6 @@
 import re
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -17,6 +19,26 @@ from master_reference import (
 )
 
 # Activity date range is defined once in data_processing.py (single source of truth)
+
+
+def _default_report_range():
+    """Default date range for the Trend and Reporting Status pickers:
+    8 Jul through today, capped at 17 Jul by default — admins can still
+    manually drag the picker past 17 Jul (up to the campaign end / today,
+    whichever is later).
+
+    Before 4pm, today's reports aren't expected to be in yet, so the
+    effective 'today' for default purposes rolls back to yesterday —
+    otherwise today would show as an (unfairly) incomplete day.
+    Uses Malawi local time explicitly, since the server itself almost
+    certainly runs in UTC."""
+    now = datetime.now(ZoneInfo("Africa/Blantyre"))
+    effective_today = now.date() if now.hour >= 16 else now.date() - timedelta(days=1)
+    default_end = min(effective_today, date(2026, 7, 17))
+    if default_end < ACTIVITY_START_DATE:
+        default_end = ACTIVITY_START_DATE
+    max_bound = max(ACTIVITY_END_DATE, now.date())
+    return ACTIVITY_START_DATE, default_end, max_bound
 
 st.set_page_config(page_title="NID & NRBC Daily Reporting Dashboard", layout="wide")
 st.title("🧾 NID & NRBC Daily Reporting Dashboard")
@@ -93,7 +115,7 @@ if is_admin:
             if refresh_clicked:
                 st.session_state.sheet_refresh_token += 1
 
-            @st.cache_data(ttl=300, show_spinner="Fetching latest responses from Google Sheets...")
+            @st.cache_data(ttl=900, show_spinner="Fetching latest responses from Google Sheets...")
             def _cached_fetch(url, _refresh_token):
                 return fetch_google_sheet(url)
 
@@ -114,7 +136,7 @@ if is_admin:
 
 else:
     if saved_url:
-        @st.cache_data(ttl=300, show_spinner="Loading latest data...")
+        @st.cache_data(ttl=900, show_spinner="Loading latest data...")
         def _cached_fetch_viewer(url):
             return fetch_google_sheet(url)
 
@@ -191,18 +213,25 @@ if missing_required:
     st.stop()
 
 raw_df = apply_mapping(raw_df, mapping)
-cleaned_df, report = clean_data(raw_df)
 
-# ------------------------------------------------------------------
-# Master reference: apply any admin-confirmed zone/center assignments, in
-# order — zone first, since center validation checks against the zone's
-# center list, so the zone needs to be correct first.
-# ------------------------------------------------------------------
-master_df = load_master()
+
+# Cache the full cleaning + assignment pipeline. Streamlit reruns this whole
+# script on every widget interaction (a filter change, a button click
+# anywhere on the page) — without caching, ~1000 rows of cleaning, dedup,
+# and date-correction would redo identical work dozens of times per minute
+# even though the underlying data only changes once per fetch cycle.
+@st.cache_data(show_spinner=False)
+def _cached_pipeline(raw_df, zone_assignments, center_assignments):
+    cleaned_df, report = clean_data(raw_df)
+    master_df = load_master()
+    cleaned_df = apply_zone_assignments(cleaned_df, zone_assignments)
+    cleaned_df = apply_center_assignments(cleaned_df, center_assignments)
+    return cleaned_df, report, master_df
+
+
 zone_assignments = load_zone_assignments()
-cleaned_df = apply_zone_assignments(cleaned_df, zone_assignments)
 center_assignments = load_center_assignments()
-cleaned_df = apply_center_assignments(cleaned_df, center_assignments)
+cleaned_df, report, master_df = _cached_pipeline(raw_df, zone_assignments, center_assignments)
 
 # ------------------------------------------------------------------
 # Data quality review panel
@@ -250,7 +279,12 @@ with st.expander("🔍 Data Quality Review", expanded=False):
         "Submitted zone names that don't match any of the predefined zones "
         "from the official campaign registry. Assign each to the correct zone."
     )
-    unmatched_zones = find_unmatched_zones(cleaned_df, master_df)
+
+    @st.cache_data(show_spinner=False)
+    def _cached_unmatched_zones(cleaned_df, master_df):
+        return find_unmatched_zones(cleaned_df, master_df)
+
+    unmatched_zones = _cached_unmatched_zones(cleaned_df, master_df)
     if not unmatched_zones:
         st.write("All submitted zone names match the master reference. ✅")
     else:
@@ -271,20 +305,28 @@ with st.expander("🔍 Data Quality Review", expanded=False):
 
     st.subheader("Center Assignment")
     st.caption(
-        "Submitted center names that don't match any known center under their "
-        "zone (only shown for zones that are already valid — fix Zone Assignment "
-        "above first if a zone is also wrong)."
+        "Submitted center names that don't match any known center. If the "
+        "zone is also valid, choices are scoped to that zone's centers; "
+        "otherwise you can pick from the full list — independent of whether "
+        "Zone Assignment above has been resolved."
     )
-    unmatched_centers = find_unmatched_centers(cleaned_df, master_df)
+
+    @st.cache_data(show_spinner=False)
+    def _cached_unmatched_centers(cleaned_df, master_df):
+        return find_unmatched_centers(cleaned_df, master_df)
+
+    unmatched_centers = _cached_unmatched_centers(cleaned_df, master_df)
     if not unmatched_centers:
         st.write("All submitted center names match the master reference. ✅")
     else:
         st.warning(f"{len(unmatched_centers)} submitted center name(s) need assignment.")
         if is_admin:
+            all_centers_sorted = sorted(master_df["Center"].unique())
             for u in unmatched_centers:
-                center_options = sorted(master_df.loc[master_df["Zone"] == u["zone"], "Center"].unique())
+                zone_matches = master_df["Zone"].str.upper() == u["zone"].strip().upper()
+                center_options = sorted(master_df.loc[zone_matches, "Center"].unique())
                 if not center_options:
-                    continue
+                    center_options = all_centers_sorted  # zone itself doesn't match — pick from everything
                 c1, c2, c3 = st.columns([2, 2, 1])
                 c1.write(f"**'{u['zone']}' / '{u['center']}'**")
                 default_idx = center_options.index(u["suggested_center"]) if u["suggested_center"] in center_options else 0
@@ -319,6 +361,13 @@ filtered = cleaned_df[
     & cleaned_df["CENTER NAME"].isin(selected_centers)
     & (cleaned_df["Date"].dt.date >= start_date)
     & (cleaned_df["Date"].dt.date <= end_date)
+]
+
+# Zone/Center filtered but NOT date-filtered — for tabs (Trend) that use
+# their own dedicated date range picker instead of the sidebar's.
+filtered_zone_center_only = cleaned_df[
+    cleaned_df["ZONE NAME"].isin(selected_zones)
+    & cleaned_df["CENTER NAME"].isin(selected_centers)
 ]
 
 if filtered.empty:
@@ -415,7 +464,22 @@ with tab2:
     st.dataframe(center_summary)
 
 with tab3:
-    trend = filtered.groupby(filtered["Date"].dt.date).agg(
+    default_start_3, default_end_3, max_bound_3 = _default_report_range()
+    range_3 = st.date_input(
+        "Date range", value=(default_start_3, default_end_3),
+        min_value=ACTIVITY_START_DATE, max_value=max_bound_3,
+        key="trend_range",
+    )
+    if isinstance(range_3, tuple) and len(range_3) == 2:
+        start_3, end_3 = range_3
+    else:
+        start_3, end_3 = default_start_3, default_end_3
+
+    trend_source = filtered_zone_center_only[
+        (filtered_zone_center_only["Date"].dt.date >= start_3)
+        & (filtered_zone_center_only["Date"].dt.date <= end_3)
+    ]
+    trend = trend_source.groupby(trend_source["Date"].dt.date).agg(
         Total_Birth_Registrations=("Total Birth Registrations", "sum"),
         Total_NID_Registrations=("Total NID Registrations", "sum"),
     ).reset_index()
@@ -429,7 +493,7 @@ with tab3:
         fig.update_xaxes(tickformat="%d %b", dtick="D1")
         st.plotly_chart(fig, width='stretch')
     else:
-        st.info("Only one date present in the current filter — trend chart will populate as more days are added.")
+        st.info("Only one date in the selected range — trend chart will populate as more days are added.")
     st.dataframe(trend)
 
 with tab4:
@@ -466,16 +530,28 @@ with tab4:
 with tab5:
     st.caption(
         f"Activity runs {ACTIVITY_START_DATE.strftime('%d %b')} to {ACTIVITY_END_DATE.strftime('%d %b %Y')}. "
-        "Pick a zone to see each of its centers' submissions for every day of the activity."
+        "Pick a zone and date range to see each center's submissions."
     )
+    default_start_5, default_end_5, max_bound_5 = _default_report_range()
+    range_5 = st.date_input(
+        "Date range", value=(default_start_5, default_end_5),
+        min_value=ACTIVITY_START_DATE, max_value=max_bound_5,
+        key="reporting_status_range",
+    )
+    if isinstance(range_5, tuple) and len(range_5) == 2:
+        start_5, end_5 = range_5
+    else:
+        start_5, end_5 = default_start_5, default_end_5
+
     zone_options_5 = sorted(master_df["Zone"].unique())
     picked_zone = st.selectbox("Zone", zone_options_5, key="reporting_status_zone")
 
-    matrix = zone_center_matrix(cleaned_df, master_df, picked_zone, ACTIVITY_START_DATE, ACTIVITY_END_DATE)
+    matrix = zone_center_matrix(cleaned_df, master_df, picked_zone, start_5, end_5)
     day_cols = [c for c in matrix.columns if c != "Center"]
     total_expected = len(matrix) * len(day_cols)
     total_submitted = int((matrix[day_cols] > 0).sum().sum())
-    st.metric(f"Reports submitted in {picked_zone}", f"{total_submitted} / {total_expected}")
+    pct = round(100 * total_submitted / total_expected, 1) if total_expected else 0
+    st.metric(f"Reports submitted in {picked_zone}", f"{total_submitted} / {total_expected}  :  {pct}%")
     st.dataframe(
         matrix,
         hide_index=True,
@@ -491,22 +567,25 @@ st.divider()
 # ------------------------------------------------------------------
 if is_admin:
     st.subheader("📤 Export Report (admin)")
-    kpis = {
-        "Total Birth Registrations": total_birth,
-        "Male Births": total_male_birth,
-        "Female Births": total_female_birth,
-        "Total NID Registrations": total_nid,
-        "Male NID": total_male_nid,
-        "Female NID": total_female_nid,
-        "Number of Zones": filtered["ZONE NAME"].nunique(),
-        "Number of Centers": filtered["CENTER NAME"].nunique(),
-        "Date Range": f"{start_date} to {end_date}",
-    }
+    st.caption("Report generation only runs when you click below — it doesn't rebuild on every page interaction.")
+    if st.button("Generate Excel Report"):
+        kpis = {
+            "Total Birth Registrations": total_birth,
+            "Male Births": total_male_birth,
+            "Female Births": total_female_birth,
+            "Total NID Registrations": total_nid,
+            "Male NID": total_male_nid,
+            "Female NID": total_female_nid,
+            "Number of Zones": filtered["ZONE NAME"].nunique(),
+            "Number of Centers": filtered["CENTER NAME"].nunique(),
+            "Date Range": f"{start_date} to {end_date}",
+        }
+        st.session_state.excel_report_bytes = build_report(filtered, report, zone_summary, center_summary, kpis)
 
-    excel_bytes = build_report(filtered, report, zone_summary, center_summary, kpis)
-    st.download_button(
-        "Download Excel Report",
-        data=excel_bytes,
-        file_name="nrbc_report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    if st.session_state.get("excel_report_bytes"):
+        st.download_button(
+            "Download Excel Report",
+            data=st.session_state.excel_report_bytes,
+            file_name="nrbc_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
