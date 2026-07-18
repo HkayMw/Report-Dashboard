@@ -13,6 +13,8 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 from openpyxl.chart import BarChart, LineChart, Reference
 
+from data_processing import NUMERIC_COLS
+
 HEADER_FILL = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
 HEADER_FONT = Font(color="FFFFFF", bold=True)
 
@@ -74,7 +76,7 @@ def build_report(cleaned_df: pd.DataFrame, report: dict, zone_summary: pd.DataFr
     ws.cell(row=row, column=1, value="Data Quality Notes").font = Font(bold=True, size=12)
     row += 1
     notes = [
-        f"Duplicate rows removed (kept latest by timestamp): {report.get('duplicates_removed_count', 0)}",
+        f"Duplicate/resubmitted rows removed (kept latest by timestamp): {report.get('duplicates_removed_count', 0)}",
         f"Rows with missing numeric values (filled with 0): {len(report.get('missing_numeric_rows', []))}",
         f"Rows with invalid/negative numbers: {len(report.get('negative_rows', []))}",
         f"Rows with non-whole-number values (likely data entry errors, e.g. 0.01): {len(report.get('non_integer_rows', []))}",
@@ -169,11 +171,11 @@ def build_report(cleaned_df: pd.DataFrame, report: dict, zone_summary: pd.DataFr
     # ---------- Flagged rows sheet ----------
     ws6 = wb.create_sheet("Flagged Rows")
     r = 1
-    ws6.cell(row=r, column=1, value="Duplicates Found").font = Font(bold=True, size=12)
+    ws6.cell(row=r, column=1, value="Duplicate/Resubmitted Rows Found").font = Font(bold=True, size=12)
     r += 1
     dupes = report.get("duplicates_found", pd.DataFrame())
     if len(dupes):
-        r = _write_df(ws6, dupes[["Timestamp", "ZONE NAME", "CENTER NAME", "Date"]], start_row=r) + 1
+        r = _write_df(ws6, dupes[["Timestamp", "ZONE NAME", "CENTER NAME", "Date"] + NUMERIC_COLS], start_row=r) + 1
     else:
         ws6.cell(row=r, column=1, value="None found")
         r += 2
@@ -197,6 +199,29 @@ def build_report(cleaned_df: pd.DataFrame, report: dict, zone_summary: pd.DataFr
     else:
         ws6.cell(row=r, column=1, value="None found")
         r += 2
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def build_completion_report(zone_df: pd.DataFrame, center_df: pd.DataFrame, start_date, end_date) -> bytes:
+    """Excel export for master_reference.completion_report()'s output: one
+    sheet per predefined zone, one per predefined center — figures only
+    reflect submissions already mapped to the predefined master list."""
+    wb = Workbook()
+
+    ws = wb.active
+    ws.title = "Zone Completion"
+    ws["A1"] = f"Zone Completion — {start_date} to {end_date}"
+    ws["A1"].font = Font(bold=True, size=14)
+    _write_df(ws, zone_df, start_row=3)
+
+    ws2 = wb.create_sheet("Center Completion")
+    ws2["A1"] = f"Center Completion — {start_date} to {end_date}"
+    ws2["A1"].font = Font(bold=True, size=14)
+    _write_df(ws2, center_df, start_row=3)
+    ws2.freeze_panes = "A4"
 
     buf = io.BytesIO()
     wb.save(buf)

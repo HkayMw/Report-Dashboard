@@ -166,8 +166,13 @@ def clean_data(df: pd.DataFrame):
     report["missing_numeric_rows"] = df[missing_numeric_mask]
     df[NUMERIC_COLS] = df[NUMERIC_COLS].fillna(0)
 
-    # --- 4. Exact duplicates: same zone/center/date/numbers -> keep latest by Timestamp ---
-    dup_subset = ["ZONE NAME", "CENTER NAME", "Date"] + NUMERIC_COLS
+    # --- 4. Duplicate/resubmitted reports: same zone/center/date -> keep latest by
+    # Timestamp. A center may resubmit a form for a day it already reported on
+    # (e.g. to correct a data-entry mistake), so this intentionally does NOT
+    # require the numeric columns to also match — the most recent submission is
+    # treated as the authoritative correction and earlier ones for that
+    # zone/center/date are dropped, even if the figures differ.
+    dup_subset = ["ZONE NAME", "CENTER NAME", "Date"]
     is_dup = df.duplicated(subset=dup_subset, keep=False)
     dup_rows = df[is_dup].sort_values(["ZONE NAME", "CENTER NAME", "Timestamp"])
     report["duplicates_found"] = dup_rows

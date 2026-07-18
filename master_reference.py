@@ -229,6 +229,64 @@ def find_unmatched_centers(cleaned_df: pd.DataFrame, master_df: pd.DataFrame) ->
 # of centers by a fixed ~11-day window is a small pivot, not a heavy computation.
 # ---------------------------------------------------------------------------
 
+def completion_report(cleaned_df: pd.DataFrame, master_df: pd.DataFrame, start_date, end_date):
+    """
+    Reporting completion for EVERY predefined zone and center (not just one
+    zone at a time, unlike zone_center_matrix above).
+
+    Only counts a submission if its (zone, center) pair matches a predefined
+    master-list pair exactly (after config.json's zone/center assignments have
+    already been applied to cleaned_df by the caller) — a submission whose
+    zone or center hasn't been assigned/mapped yet is excluded entirely, so
+    completion figures never get inflated by not-yet-reconciled data.
+
+    Returns (zone_df, center_df):
+      center_df: one row per predefined center — Zone, Center, Days Expected,
+                 Days Submitted, Completion %
+      zone_df: one row per predefined zone — aggregated across its centers
+    """
+    date_cols = list(pd.date_range(start_date, end_date, freq="D").date)
+    n_days = len(date_cols)
+
+    sub = cleaned_df[
+        (cleaned_df["Date"] >= pd.Timestamp(start_date)) & (cleaned_df["Date"] <= pd.Timestamp(end_date))
+    ].copy()
+    sub["_zone_norm"] = sub["ZONE NAME"].apply(_normalize)
+    sub["_center_norm"] = sub["CENTER NAME"].apply(_normalize)
+    sub["_date"] = sub["Date"].dt.date
+
+    valid_pairs = set(zip(master_df["Zone_norm"], master_df["Center_norm"]))
+    pairs = pd.Series(list(zip(sub["_zone_norm"], sub["_center_norm"])), index=sub.index)
+    sub = sub[pairs.isin(valid_pairs)]
+
+    submitted_days = sub.groupby(["_zone_norm", "_center_norm"])["_date"].nunique()
+
+    centers = master_df[["Zone", "Center", "Zone_norm", "Center_norm"]].drop_duplicates()
+    center_rows = []
+    for _, row in centers.iterrows():
+        key = (row["Zone_norm"], row["Center_norm"])
+        submitted = int(submitted_days.get(key, 0))
+        center_rows.append({
+            "Zone": row["Zone"],
+            "Center": row["Center"],
+            "Days Expected": n_days,
+            "Days Submitted": submitted,
+            "Completion %": round(100 * submitted / n_days, 1) if n_days else 0.0,
+        })
+    center_df = pd.DataFrame(center_rows).sort_values(["Zone", "Center"]).reset_index(drop=True)
+
+    zone_df = center_df.groupby("Zone").agg(
+        Centers=("Center", "count"),
+        **{"Total Days Expected": ("Days Expected", "sum"), "Total Days Submitted": ("Days Submitted", "sum")},
+    ).reset_index()
+    zone_df["Completion %"] = (
+        100 * zone_df["Total Days Submitted"] / zone_df["Total Days Expected"]
+    ).round(1)
+    zone_df = zone_df.sort_values("Zone").reset_index(drop=True)
+
+    return zone_df, center_df
+
+
 def zone_center_matrix(cleaned_df: pd.DataFrame, master_df: pd.DataFrame, zone: str, start_date, end_date):
     """
     For one zone, returns a DataFrame: rows = centers under that zone (from the

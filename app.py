@@ -5,15 +5,15 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-from data_processing import load_raw, clean_data, prepare_raw_columns, ACTIVITY_START_DATE, ACTIVITY_END_DATE
-from report_generator import build_report
+from data_processing import load_raw, clean_data, prepare_raw_columns, ACTIVITY_START_DATE, ACTIVITY_END_DATE, NUMERIC_COLS
+from report_generator import build_report, build_completion_report
 from google_sheets import fetch_google_sheet, load_saved_url, save_url
 from column_mapping import (
     suggest_mapping, load_saved_mapping, save_mapping, apply_mapping, REQUIRED_FIELDS
 )
 from auth import verify_pin, set_pin, is_default_pin_active
 from master_reference import (
-    load_master, zone_center_matrix,
+    load_master, zone_center_matrix, completion_report,
     find_unmatched_zones, save_zone_assignment, load_zone_assignments, apply_zone_assignments,
     find_unmatched_centers, save_center_assignment, load_center_assignments, apply_center_assignments,
 )
@@ -237,9 +237,9 @@ cleaned_df, report, master_df = _cached_pipeline(raw_df, zone_assignments, cente
 # Data quality review panel
 # ------------------------------------------------------------------
 with st.expander("🔍 Data Quality Review", expanded=False):
-    st.write(f"**Duplicate rows auto-removed (kept latest by timestamp):** {report['duplicates_removed_count']}")
+    st.write(f"**Duplicate/resubmitted rows auto-removed (kept latest by timestamp):** {report['duplicates_removed_count']}")
     if len(report["duplicates_found"]):
-        st.dataframe(report["duplicates_found"][["Timestamp", "ZONE NAME", "CENTER NAME", "Date"]])
+        st.dataframe(report["duplicates_found"][["Timestamp", "ZONE NAME", "CENTER NAME", "Date"] + NUMERIC_COLS])
 
     DIAG_COLS = ["ZONE NAME", "CENTER NAME", "Date",
                  "Total Male Births Registered", "Total Female Births Registered",
@@ -559,6 +559,27 @@ with tab5:
             c: st.column_config.NumberColumn(c, format="%d") for c in day_cols
         },
     )
+
+    st.divider()
+    st.caption(
+        "Exports completion for every predefined zone and center over the date "
+        "range above. Only counts submissions already mapped to a predefined "
+        "zone/center (via the Zone/Center Assignment above) — unmapped "
+        "submissions are excluded, not guessed at."
+    )
+    if st.button("📊 Generate Zone & Center Completion Report"):
+        zone_completion, center_completion = completion_report(cleaned_df, master_df, start_5, end_5)
+        st.session_state.completion_report_bytes = build_completion_report(
+            zone_completion, center_completion, start_5, end_5
+        )
+
+    if st.session_state.get("completion_report_bytes"):
+        st.download_button(
+            "Download Completion Report",
+            data=st.session_state.completion_report_bytes,
+            file_name="zone_center_completion_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
 st.divider()
 
