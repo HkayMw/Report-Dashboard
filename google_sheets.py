@@ -6,11 +6,7 @@ Works when the sheet is shared as "Anyone with the link can view" — no
 Google API credentials needed, since we use the plain CSV export endpoint.
 """
 import re
-import json
-import os
 import pandas as pd
-
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 
 
 def extract_sheet_id(url_or_id: str) -> str:
@@ -49,29 +45,3 @@ def fetch_google_sheet(url_or_id: str) -> pd.DataFrame:
             f"Original error: {e}"
         )
     return df
-
-
-def load_saved_url() -> str:
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH) as f:
-                return json.load(f).get("google_sheet_url", "")
-        except Exception:
-            return ""
-    return ""
-
-
-def save_url(url: str) -> None:
-    data = {}
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH) as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-    data["google_sheet_url"] = url
-    try:
-        with open(CONFIG_PATH, "w") as f:
-            json.dump(data, f)
-    except Exception:
-        pass  # non-fatal if we can't persist, e.g. read-only filesystem

@@ -1,3 +1,4 @@
+import io
 import re
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -5,27 +6,33 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-from data_processing import load_raw, clean_data, prepare_raw_columns, ACTIVITY_START_DATE, ACTIVITY_END_DATE, NUMERIC_COLS
+from data_processing import load_raw, clean_data, prepare_raw_columns, NUMERIC_COLS
 from report_generator import build_report, build_completion_report
-from google_sheets import fetch_google_sheet, load_saved_url, save_url
+from google_sheets import fetch_google_sheet
 from column_mapping import (
     suggest_mapping, load_saved_mapping, save_mapping, apply_mapping, REQUIRED_FIELDS
 )
 from auth import verify_pin, set_pin, is_default_pin_active
 from master_reference import (
     load_master, zone_center_matrix, completion_report,
-    find_unmatched_zones, save_zone_assignment, load_zone_assignments, apply_zone_assignments,
-    find_unmatched_centers, save_center_assignment, load_center_assignments, apply_center_assignments,
+    district_options, filter_by_district, districts_for_zones, districts_for_centers, normalize_name,
+    find_unmatched_zones, apply_zone_assignments,
+    find_unmatched_centers, apply_center_assignments,
+)
+from phases import (
+    list_phases, get_active_phase, set_active_phase, create_phase,
+    update_active_phase, update_phase, delete_phase, phase_dates, master_path_for,
+    load_zone_assignments, save_zone_assignment,
+    load_center_assignments, save_center_assignment,
 )
 
-# Activity date range is defined once in data_processing.py (single source of truth)
+# Activity dates/title/sheet/master all come from the active phase (phases.py)
 
 
-def _default_report_range():
+def _default_report_range(phase_start, phase_end):
     """Default date range for the Trend and Reporting Status pickers:
-    8 Jul through today, capped at 17 Jul by default — admins can still
-    manually drag the picker past 17 Jul (up to the campaign end / today,
-    whichever is later).
+    phase start through today, capped at the phase end — admins can still
+    manually drag the picker up to the phase end / today, whichever is later.
 
     Before 4pm, today's reports aren't expected to be in yet, so the
     effective 'today' for default purposes rolls back to yesterday —
@@ -34,11 +41,11 @@ def _default_report_range():
     certainly runs in UTC."""
     now = datetime.now(ZoneInfo("Africa/Blantyre"))
     effective_today = now.date() if now.hour >= 16 else now.date() - timedelta(days=1)
-    default_end = min(effective_today, date(2026, 7, 17))
-    if default_end < ACTIVITY_START_DATE:
-        default_end = ACTIVITY_START_DATE
-    max_bound = max(ACTIVITY_END_DATE, now.date())
-    return ACTIVITY_START_DATE, default_end, max_bound
+    default_end = min(effective_today, phase_end)
+    if default_end < phase_start:
+        default_end = phase_start
+    max_bound = max(phase_end, now.date())
+    return phase_start, default_end, max_bound
 
 st.set_page_config(page_title="NID & NRBC Daily Reporting Dashboard", layout="wide")
 st.title("🧾 NID & NRBC Daily Reporting Dashboard")
@@ -87,10 +94,128 @@ else:
 is_admin = st.session_state.is_admin
 
 # ------------------------------------------------------------------
+# Active phase (activity) — title, dates, sheet URL, master list all
+# come from here; admins can create/switch phases without code changes.
+# ------------------------------------------------------------------
+phase = get_active_phase()
+phase_start, phase_end = phase_dates(phase)
+st.info(f"**Activity:** {phase['title']}  ({phase_start.strftime('%d %b %Y')} – {phase_end.strftime('%d %b %Y')})")
+
+if is_admin:
+    with st.expander("🗃️ Phases / Activities (admin)"):
+        all_phases = list_phases()
+        labels = {p["id"]: f"{p['title']} ({p['start_date']} – {p['end_date']})" for p in all_phases}
+        ids = [p["id"] for p in all_phases]
+        picked = st.selectbox(
+            "Active phase", ids,
+            index=ids.index(phase["id"]),
+            format_func=lambda i: labels[i],
+            key="phase_picker",
+        )
+        if picked != phase["id"] and st.button("Switch to selected phase"):
+            set_active_phase(picked)
+            st.rerun()
+
+        sel_phase = next(p for p in all_phases if p["id"] == picked)
+
+        st.divider()
+        st.markdown("**Edit selected phase**")
+        e_title = st.text_input("Title", value=sel_phase["title"], key=f"edit_title_{picked}")
+        ec1, ec2 = st.columns(2)
+        e_start = ec1.date_input("Start date", value=date.fromisoformat(sel_phase["start_date"]),
+                                 key=f"edit_start_{picked}")
+        e_end = ec2.date_input("End date", value=date.fromisoformat(sel_phase["end_date"]),
+                               key=f"edit_end_{picked}")
+        e_url = st.text_input("Google Sheet URL", value=sel_phase.get("google_sheet_url", ""),
+                              key=f"edit_url_{picked}")
+        e_master = st.file_uploader(
+            "Replace master reference CSV (optional — columns: District, Zone, Center)",
+            type=["csv"], key=f"edit_master_{picked}",
+        )
+        if st.button("Save changes", key=f"edit_save_{picked}"):
+            if not e_title.strip():
+                st.error("Title can't be empty.")
+            elif e_end < e_start:
+                st.error("End date must be on or after the start date.")
+            else:
+                e_master_bytes = None
+                if e_master is not None:
+                    e_master_bytes = e_master.getvalue()
+                    try:
+                        check = pd.read_csv(io.BytesIO(e_master_bytes), nrows=1)
+                        missing_cols = [c for c in ("District", "Zone", "Center") if c not in check.columns]
+                    except Exception:
+                        missing_cols = ["District", "Zone", "Center"]
+                    if missing_cols:
+                        st.error(f"Master CSV is missing column(s): {', '.join(missing_cols)}.")
+                        st.stop()
+                update_phase(picked, title=e_title.strip(), start_date=e_start, end_date=e_end,
+                             google_sheet_url=e_url.strip(), master_csv_bytes=e_master_bytes)
+                st.success("Phase updated.")
+                st.rerun()
+
+        st.markdown("**Delete selected phase**")
+        st.caption(
+            "Deletes the phase, its name-correction assignments, and its own "
+            "master CSV (if it uploaded one). The submitted data in its Google "
+            "Sheet is NOT touched. This cannot be undone."
+        )
+        del_ok = st.checkbox(
+            f"Yes, permanently delete '{sel_phase['title']}'", key=f"del_confirm_{picked}"
+        )
+        if st.button("Delete phase", key=f"del_btn_{picked}", disabled=not del_ok):
+            ok, msg = delete_phase(picked)
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+        st.divider()
+        st.markdown("**Create a new phase**")
+        st.caption(
+            "A phase is one activity: its own dates, Google Sheet, master "
+            "zone/center list, and name corrections. Leave the master CSV "
+            "empty to reuse the current master list (same locations, new "
+            "time period)."
+        )
+        new_title = st.text_input("Title", key="new_phase_title",
+                                  placeholder="e.g. NID & NRBC Registration — Lilongwe, Oct 2026")
+        c1, c2 = st.columns(2)
+        new_start = c1.date_input("Start date", key="new_phase_start")
+        new_end = c2.date_input("End date", key="new_phase_end")
+        new_url = st.text_input("Google Sheet URL (optional, can be set later)", key="new_phase_url")
+        new_master = st.file_uploader(
+            "Master reference CSV (optional — columns: District, Zone, Center)",
+            type=["csv"], key="new_phase_master",
+        )
+        if st.button("Create phase"):
+            if not new_title.strip():
+                st.error("Give the phase a title.")
+            elif new_end < new_start:
+                st.error("End date must be on or after the start date.")
+            else:
+                master_bytes = None
+                if new_master is not None:
+                    master_bytes = new_master.getvalue()
+                    try:
+                        check = pd.read_csv(io.BytesIO(master_bytes), nrows=1)
+                        missing_cols = [c for c in ("District", "Zone", "Center") if c not in check.columns]
+                    except Exception:
+                        missing_cols = ["District", "Zone", "Center"]
+                    if missing_cols:
+                        st.error(f"Master CSV is missing column(s): {', '.join(missing_cols)}.")
+                        st.stop()
+                created = create_phase(new_title.strip(), new_start, new_end, new_url.strip(), master_bytes)
+                set_active_phase(created["id"])
+                st.success(f"Phase '{new_title}' created and activated.")
+                st.rerun()
+
+# ------------------------------------------------------------------
 # Data source: Google Sheet (live) or manual upload
 # ------------------------------------------------------------------
 raw_df = None
-saved_url = load_saved_url()
+saved_url = phase.get("google_sheet_url", "")
 
 if is_admin:
     st.subheader("Data Source (admin)")
@@ -111,7 +236,7 @@ if is_admin:
 
         if sheet_url:
             if sheet_url != saved_url:
-                save_url(sheet_url)
+                update_active_phase(google_sheet_url=sheet_url)
             if refresh_clicked:
                 st.session_state.sheet_refresh_token += 1
 
@@ -221,9 +346,9 @@ raw_df = apply_mapping(raw_df, mapping)
 # and date-correction would redo identical work dozens of times per minute
 # even though the underlying data only changes once per fetch cycle.
 @st.cache_data(show_spinner=False)
-def _cached_pipeline(raw_df, zone_assignments, center_assignments):
-    cleaned_df, report = clean_data(raw_df)
-    master_df = load_master()
+def _cached_pipeline(raw_df, zone_assignments, center_assignments, master_path, p_start, p_end):
+    cleaned_df, report = clean_data(raw_df, p_start, p_end)
+    master_df = load_master(master_path)
     cleaned_df = apply_zone_assignments(cleaned_df, zone_assignments)
     cleaned_df = apply_center_assignments(cleaned_df, center_assignments)
     return cleaned_df, report, master_df
@@ -231,7 +356,10 @@ def _cached_pipeline(raw_df, zone_assignments, center_assignments):
 
 zone_assignments = load_zone_assignments()
 center_assignments = load_center_assignments()
-cleaned_df, report, master_df = _cached_pipeline(raw_df, zone_assignments, center_assignments)
+cleaned_df, report, master_df = _cached_pipeline(
+    raw_df, zone_assignments, center_assignments,
+    master_path_for(phase), phase_start, phase_end,
+)
 
 # ------------------------------------------------------------------
 # Data quality review panel
@@ -265,10 +393,20 @@ with st.expander("🔍 Data Quality Review", expanded=False):
             [c for c in DIAG_COLS if c in report["non_integer_rows"].columns]
         ])
 
+    if len(report.get("out_of_range_rows", [])):
+        st.warning(
+            f"{len(report['out_of_range_rows'])} row(s) have a date outside the "
+            f"activity window ({phase_start.strftime('%d %b')}–{phase_end.strftime('%d %b %Y')}) "
+            "that couldn't be auto-corrected — likely data entry errors. They are "
+            "excluded from all figures (the date filter is bounded to the activity "
+            "window). Fix the date in the source sheet to include them."
+        )
+        st.dataframe(report["out_of_range_rows"].astype(str))
+
     if len(report["date_corrected_rows"]):
         st.info(
             f"{len(report['date_corrected_rows'])} row(s) had a date outside the "
-            f"activity window ({ACTIVITY_START_DATE.strftime('%d %b')}–{ACTIVITY_END_DATE.strftime('%d %b')}) "
+            f"activity window ({phase_start.strftime('%d %b')}–{phase_end.strftime('%d %b')}) "
             "that resolved correctly once day/month were swapped — auto-corrected. "
             "This usually means a spreadsheet locale mismatch, not a data entry mistake."
         )
@@ -338,37 +476,91 @@ with st.expander("🔍 Data Quality Review", expanded=False):
         else:
             st.dataframe(pd.DataFrame(unmatched_centers))
 
+# Everything below only counts rows mapped to the master list (the sidebar
+# filters are master-driven), so surface how much data is being held back —
+# otherwise unmapped submissions would vanish from the totals silently.
+_n_unmapped = int((~(
+    cleaned_df["ZONE NAME"].apply(normalize_name).isin(set(master_df["Zone_norm"]))
+    & cleaned_df["CENTER NAME"].apply(normalize_name).isin(set(master_df["Center_norm"]))
+)).sum())
+if _n_unmapped:
+    st.warning(
+        f"{_n_unmapped} submitted row(s) have a zone or center not yet mapped "
+        "to the master reference list and are excluded from all figures below. "
+        "Resolve them in Zone/Center Assignment (Data Quality Review) to include them."
+    )
+
+# ------------------------------------------------------------------
+# District scope — everything below (sidebar filters, KPIs, charts,
+# reporting status, exports) sees only the selected district's data.
+# A submitted row's district comes from its (assignment-corrected) zone
+# looked up in the master list; rows whose zone is still unmapped can't
+# be placed in a district, so they only appear under ALL.
+# ------------------------------------------------------------------
+district_choice = st.radio(
+    "District",
+    ["ALL"] + district_options(master_df),
+    horizontal=True,
+    key="district_scope",
+)
+if district_choice != "ALL":
+    cleaned_df, master_df = filter_by_district(cleaned_df, master_df, district_choice)
+    if cleaned_df.empty:
+        st.warning(f"No submissions mapped to {district_choice} yet.")
+        st.stop()
+
 # ------------------------------------------------------------------
 # Sidebar filters
 # ------------------------------------------------------------------
 st.sidebar.header("Filters")
-zones = sorted(cleaned_df["ZONE NAME"].unique())
+# Zone/Center options come from the master reference list (already scoped by
+# the district toggle) — NOT from submitted data — so a center that hasn't
+# reported at all is still selectable and visible downstream. Submitted rows
+# are matched on normalized names; rows whose zone or center isn't mapped to
+# the master list are excluded from these views entirely (resolve them in
+# Zone/Center Assignment above to bring them in).
+zones = sorted(master_df["Zone"].unique())
 selected_zones = st.sidebar.multiselect("Zone", zones, default=zones)
+selected_zone_norms = {normalize_name(z) for z in selected_zones}
 
-centers_available = sorted(cleaned_df[cleaned_df["ZONE NAME"].isin(selected_zones)]["CENTER NAME"].unique())
+centers_available = sorted(master_df.loc[master_df["Zone_norm"].isin(selected_zone_norms), "Center"].unique())
 selected_centers = st.sidebar.multiselect("Center", centers_available, default=centers_available)
+selected_center_norms = {normalize_name(c) for c in selected_centers}
 
-min_date = cleaned_df["Date"].min().date()
-max_date = cleaned_df["Date"].max().date()
+# The date filter is bounded by the ACTIVE PHASE's window — never by the
+# data. A mistyped date (e.g. 8 Sep in a July campaign) used to stretch
+# this picker months wide; such rows are now flagged in Data Quality
+# Review instead and excluded by these bounds.
+min_date = phase_start
+max_date = phase_end
 date_range = st.sidebar.date_input("Date range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
 if isinstance(date_range, tuple) and len(date_range) == 2:
     start_date, end_date = date_range
 else:
     start_date, end_date = min_date, max_date
 
+zc_mask = (
+    cleaned_df["ZONE NAME"].apply(normalize_name).isin(selected_zone_norms)
+    & cleaned_df["CENTER NAME"].apply(normalize_name).isin(selected_center_norms)
+)
+
 filtered = cleaned_df[
-    cleaned_df["ZONE NAME"].isin(selected_zones)
-    & cleaned_df["CENTER NAME"].isin(selected_centers)
+    zc_mask
     & (cleaned_df["Date"].dt.date >= start_date)
     & (cleaned_df["Date"].dt.date <= end_date)
-]
+].copy()
 
 # Zone/Center filtered but NOT date-filtered — for tabs (Trend) that use
 # their own dedicated date range picker instead of the sidebar's.
-filtered_zone_center_only = cleaned_df[
-    cleaned_df["ZONE NAME"].isin(selected_zones)
-    & cleaned_df["CENTER NAME"].isin(selected_centers)
-]
+filtered_zone_center_only = cleaned_df[zc_mask].copy()
+
+# Standardize display casing to the master list's spelling, so one center
+# submitted under two casings can't split into two rows in groupbys/charts.
+_zone_disp = dict(zip(master_df["Zone_norm"], master_df["Zone"]))
+_center_disp = dict(zip(master_df["Center_norm"], master_df["Center"]))
+for _df in (filtered, filtered_zone_center_only):
+    _df["ZONE NAME"] = _df["ZONE NAME"].apply(lambda z: _zone_disp[normalize_name(z)])
+    _df["CENTER NAME"] = _df["CENTER NAME"].apply(lambda c: _center_disp[normalize_name(c)])
 
 if filtered.empty:
     st.warning("No data matches the current filters.")
@@ -409,11 +601,23 @@ zone_summary = filtered.groupby("ZONE NAME").agg(
     Total_NID_Registrations=("Total NID Registrations", "sum"),
     Male_NID=("Total Males Processed", "sum"),
     Female_NID=("Total Females Processed", "sum"),
-).sort_values("Total_Birth_Registrations", ascending=False)
+)
 zone_summary.columns = [
     "Total Birth Registrations", "Male Births", "Female Births",
     "Total NID Registrations", "Male NID", "Female NID",
 ]
+# Include every selected master-list zone, even ones with no submissions yet —
+# a zone that hasn't reported shows up with zeros instead of vanishing.
+zone_summary = (
+    zone_summary.reindex(sorted(selected_zones))
+    .fillna(0).astype(int)
+    .sort_values("Total Birth Registrations", ascending=False)
+)
+# Under ALL, zones from both districts are mixed in one table — label each
+# with its district so the view stays readable. (Redundant when a single
+# district is selected, so skipped there.)
+if district_choice == "ALL":
+    zone_summary.insert(0, "District", districts_for_zones(zone_summary.index, master_df))
 
 center_summary = filtered.groupby("CENTER NAME").agg(
     Total_Birth_Registrations=("Total Birth Registrations", "sum"),
@@ -422,11 +626,18 @@ center_summary = filtered.groupby("CENTER NAME").agg(
     Total_NID_Registrations=("Total NID Registrations", "sum"),
     Male_NID=("Total Males Processed", "sum"),
     Female_NID=("Total Females Processed", "sum"),
-).sort_values("Total_Birth_Registrations", ascending=False)
+)
 center_summary.columns = [
     "Total Birth Registrations", "Male Births", "Female Births",
     "Total NID Registrations", "Male NID", "Female NID",
 ]
+# Same as zone_summary: every selected master-list center appears, zeros
+# for centers that haven't reported.
+center_summary = (
+    center_summary.reindex(sorted(set(selected_centers)))
+    .fillna(0).astype(int)
+    .sort_values("Total Birth Registrations", ascending=False)
+)
 
 # ------------------------------------------------------------------
 # Charts
@@ -464,10 +675,10 @@ with tab2:
     st.dataframe(center_summary)
 
 with tab3:
-    default_start_3, default_end_3, max_bound_3 = _default_report_range()
+    default_start_3, default_end_3, max_bound_3 = _default_report_range(phase_start, phase_end)
     range_3 = st.date_input(
         "Date range", value=(default_start_3, default_end_3),
-        min_value=ACTIVITY_START_DATE, max_value=max_bound_3,
+        min_value=phase_start, max_value=max_bound_3,
         key="trend_range",
     )
     if isinstance(range_3, tuple) and len(range_3) == 2:
@@ -529,13 +740,13 @@ with tab4:
 
 with tab5:
     st.caption(
-        f"Activity runs {ACTIVITY_START_DATE.strftime('%d %b')} to {ACTIVITY_END_DATE.strftime('%d %b %Y')}. "
+        f"Activity runs {phase_start.strftime('%d %b')} to {phase_end.strftime('%d %b %Y')}. "
         "Pick a zone and date range to see each center's submissions."
     )
-    default_start_5, default_end_5, max_bound_5 = _default_report_range()
+    default_start_5, default_end_5, max_bound_5 = _default_report_range(phase_start, phase_end)
     range_5 = st.date_input(
         "Date range", value=(default_start_5, default_end_5),
-        min_value=ACTIVITY_START_DATE, max_value=max_bound_5,
+        min_value=phase_start, max_value=max_bound_5,
         key="reporting_status_range",
     )
     if isinstance(range_5, tuple) and len(range_5) == 2:
@@ -568,9 +779,11 @@ with tab5:
         "submissions are excluded, not guessed at."
     )
     if st.button("📊 Generate Zone & Center Completion Report"):
-        zone_completion, center_completion = completion_report(cleaned_df, master_df, start_5, end_5)
+        district_completion, zone_completion, center_completion = completion_report(
+            cleaned_df, master_df, start_5, end_5
+        )
         st.session_state.completion_report_bytes = build_completion_report(
-            zone_completion, center_completion, start_5, end_5
+            district_completion, zone_completion, center_completion, start_5, end_5
         )
 
     if st.session_state.get("completion_report_bytes"):
@@ -600,8 +813,20 @@ if is_admin:
             "Number of Zones": filtered["ZONE NAME"].nunique(),
             "Number of Centers": filtered["CENTER NAME"].nunique(),
             "Date Range": f"{start_date} to {end_date}",
+            "District": district_choice,
+            "Activity": phase["title"],
         }
-        st.session_state.excel_report_bytes = build_report(filtered, report, zone_summary, center_summary, kpis)
+        # The export always carries district labels — even under ALL — so the
+        # workbook can separate each district into its own section/charts.
+        zone_export = zone_summary.copy()
+        if "District" not in zone_export.columns:
+            zone_export.insert(0, "District", districts_for_zones(zone_export.index, master_df))
+        center_export = center_summary.copy()
+        if "District" not in center_export.columns:
+            center_export.insert(0, "District", districts_for_centers(center_export.index, master_df))
+        filtered_export = filtered.copy()
+        filtered_export["District"] = districts_for_zones(filtered_export["ZONE NAME"], master_df)
+        st.session_state.excel_report_bytes = build_report(filtered_export, report, zone_export, center_export, kpis)
 
     if st.session_state.get("excel_report_bytes"):
         st.download_button(

@@ -17,9 +17,10 @@ NUMERIC_COLS = [
     "Total Males Processed", "Total Females Processed",
 ]
 
-# The activity's fixed date range — single source of truth, also used by
-# app.py's Reporting Status tab and by the date-correction heuristic below.
-# Update here if the campaign's dates change.
+# Fallback activity date range, used when no phase is configured (phases.py
+# is the real source of truth now — each phase carries its own dates, passed
+# into clean_data below; these constants remain as defaults and for the
+# legacy-migration path).
 ACTIVITY_START_DATE = date(2026, 7, 8)
 ACTIVITY_END_DATE = date(2026, 7, 18)
 
@@ -73,10 +74,15 @@ def load_raw(file) -> pd.DataFrame:
     return prepare_raw_columns(df)
 
 
-def clean_data(df: pd.DataFrame):
+def clean_data(df: pd.DataFrame, activity_start: date = ACTIVITY_START_DATE,
+               activity_end: date = ACTIVITY_END_DATE):
     """
     Clean the raw dataframe: parse dates, normalize zone/center text casing,
     coerce numeric fields, flag data-quality issues, dedupe.
+
+    activity_start/activity_end bound the day/month swap-correction
+    heuristic — pass the active phase's dates so date fixes track the
+    campaign actually being viewed.
 
     Zone/center CORRECTION (typo fixes, zone/center swaps, mapping to the
     predefined master list) is handled separately by master_reference.py's
@@ -109,8 +115,8 @@ def clean_data(df: pd.DataFrame):
     # locale mismatch), which dayfirst=True can't fix since ISO-formatted
     # strings have no ambiguity left to resolve at parse time.
     pre_fix_date = df["Date"].copy()
-    df["Date"] = _fix_swapped_day_month(df["Date"], ACTIVITY_START_DATE, ACTIVITY_END_DATE)
-    df["Timestamp"] = _fix_swapped_day_month(df["Timestamp"], ACTIVITY_START_DATE, ACTIVITY_END_DATE)
+    df["Date"] = _fix_swapped_day_month(df["Date"], activity_start, activity_end)
+    df["Timestamp"] = _fix_swapped_day_month(df["Timestamp"], activity_start, activity_end)
     date_corrected_mask = (df["Date"] != pre_fix_date) & df["Date"].notna() & pre_fix_date.notna()
     report["date_corrected_rows"] = df.loc[
         date_corrected_mask, ["ZONE NAME", "CENTER NAME"]
@@ -118,6 +124,15 @@ def clean_data(df: pd.DataFrame):
 
     bad_dates = df[df["Date"].isna() | df["Timestamp"].isna()]
     report["bad_dates"] = bad_dates
+
+    # Valid dates that still fall outside the activity window after the swap
+    # correction (e.g. 8 Sep in a July campaign — no orientation fits). These
+    # are almost certainly data-entry errors; they're excluded from all stats
+    # because the date filter is bounded to the activity window.
+    out_of_range_mask = df["Date"].notna() & ~df["Date"].dt.date.between(activity_start, activity_end)
+    report["out_of_range_rows"] = df.loc[
+        out_of_range_mask, ["Timestamp", "ZONE NAME", "CENTER NAME", "Date"]
+    ]
 
     # --- 2. Normalize text fields (whitespace/case) ---
     df["ZONE NAME_raw"] = df["ZONE NAME"]

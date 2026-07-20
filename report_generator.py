@@ -26,20 +26,21 @@ EXPORT_COLS = [
 ]
 
 
-def _write_df(ws, df, start_row=1, index=False):
-    """Write a dataframe to a worksheet starting at start_row, styled header."""
+def _write_df(ws, df, start_row=1, start_col=1, index=False):
+    """Write a dataframe to a worksheet starting at (start_row, start_col),
+    styled header. start_col > 1 lets several tables sit side by side."""
     cols = ([df.index.name or ""] if index else []) + list(df.columns)
-    for j, col_name in enumerate(cols, start=1):
+    for j, col_name in enumerate(cols, start=start_col):
         cell = ws.cell(row=start_row, column=j, value=str(col_name))
         cell.font = HEADER_FONT
         cell.fill = HEADER_FILL
         cell.alignment = Alignment(horizontal="center")
 
     for i, (idx, row) in enumerate(df.iterrows(), start=start_row + 1):
-        offset = 1
+        offset = start_col
         if index:
-            ws.cell(row=i, column=1, value=idx)
-            offset = 2
+            ws.cell(row=i, column=start_col, value=idx)
+            offset = start_col + 1
         for j, val in enumerate(row, start=offset):
             if pd.isna(val):
                 val = None
@@ -47,13 +48,94 @@ def _write_df(ws, df, start_row=1, index=False):
                 val = val.isoformat()
             ws.cell(row=i, column=j, value=val)
 
-    for j, col_name in enumerate(cols, start=1):
+    for j, col_name in enumerate(cols, start=start_col):
+        rel = j - start_col
         max_len = max(
-            [len(str(col_name))] + [len(str(v)) for v in (df.index if index and j == 1 else df.iloc[:, j - (2 if index else 1)])]
+            [len(str(col_name))] + [len(str(v)) for v in (df.index if index and rel == 0 else df.iloc[:, rel - (1 if index else 0)])]
         ) if len(df) else len(str(col_name))
         ws.column_dimensions[get_column_letter(j)].width = min(max(max_len + 2, 10), 40)
 
     return start_row + len(df) + 1  # next free row
+
+
+def _districts_in(df: pd.DataFrame) -> list:
+    """Distinct non-empty district labels in a summary frame ([] when the
+    frame has no District column)."""
+    if "District" not in df.columns:
+        return []
+    return sorted(d for d in df["District"].astype(str).unique() if d.strip())
+
+
+def _add_bar_chart(ws, title, y_title, x_title, value_col, label_col,
+                   header_row, n_rows, anchor, size):
+    chart = BarChart()
+    chart.title = title
+    chart.y_axis.title = y_title
+    chart.x_axis.title = x_title
+    data = Reference(ws, min_col=value_col, min_row=header_row,
+                     max_row=header_row + n_rows, max_col=value_col)
+    cats = Reference(ws, min_col=label_col, min_row=header_row + 1,
+                     max_row=header_row + n_rows)
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(cats)
+    chart.width, chart.height = size
+    ws.add_chart(chart, anchor)
+
+
+# One anchored chart occupies roughly this many worksheet rows at the chart
+# heights used here — spacing constant for stacking charts above tables.
+_CHART_ROWS = 21
+
+
+def _write_summary_sheet(ws, df, label_col, entity, chart_size, chart_top_n=None):
+    """Write a per-zone/per-center summary sheet with GRAPHS ON TOP and the
+    data below them. With multiple districts, each district gets its own
+    vertical band — its charts stacked at the top, its table underneath —
+    and the bands sit side by side for easy district comparison."""
+    districts = _districts_in(df)
+    if len(districts) <= 1:
+        n = len(df)
+        table_start = (_CHART_ROWS + 2) if n else 1
+        _write_df(ws, df, start_row=table_start)
+        if n:
+            n_chart = min(n, chart_top_n or n)
+            suffix = f" (top {n_chart})" if n_chart < n else ""
+            col_birth = list(df.columns).index("Total Birth Registrations") + 1
+            col_nid = list(df.columns).index("Total NID Registrations") + 1
+            _add_bar_chart(ws, f"Birth Registrations by {entity}{suffix}", "Births Registered",
+                           entity, col_birth, 1, table_start, n_chart, "A1", chart_size)
+            _add_bar_chart(ws, f"NID Registrations by {entity}{suffix}", "NID Registrations",
+                           entity, col_nid, 1, table_start, n_chart, "K1", chart_size)
+        return
+
+    n_cols = len(df.columns)
+    band_width = n_cols + 1  # one spacer column between district bands
+    # Charts must fit inside their band so neighbouring districts' charts
+    # don't overlap: ~1.8cm per default-width column.
+    band_chart_size = (max(10, int(n_cols * 1.8)), chart_size[1])
+    table_start = 2 + 2 * _CHART_ROWS  # title row + two stacked charts
+
+    for i, d in enumerate(districts):
+        band_col = 1 + i * band_width
+        col_letter = get_column_letter(band_col)
+        sub = df[df["District"].astype(str) == d]
+        n = len(sub)
+        ws.cell(row=1, column=band_col, value=d).font = Font(bold=True, size=14)
+        _write_df(ws, sub, start_row=table_start, start_col=band_col)
+        if not n:
+            continue
+        n_chart = min(n, chart_top_n or n)
+        cols = list(sub.columns)
+        col_birth = band_col + cols.index("Total Birth Registrations")
+        col_nid = band_col + cols.index("Total NID Registrations")
+        label_idx = band_col + cols.index(label_col)
+        suffix = f" (top {n_chart})" if n_chart < n else ""
+        _add_bar_chart(ws, f"Birth Registrations by {entity} — {d}{suffix}", "Births Registered",
+                       entity, col_birth, label_idx, table_start, n_chart,
+                       f"{col_letter}2", band_chart_size)
+        _add_bar_chart(ws, f"NID Registrations by {entity} — {d}{suffix}", "NID Registrations",
+                       entity, col_nid, label_idx, table_start, n_chart,
+                       f"{col_letter}{2 + _CHART_ROWS}", band_chart_size)
 
 
 def build_report(cleaned_df: pd.DataFrame, report: dict, zone_summary: pd.DataFrame,
@@ -71,6 +153,18 @@ def build_report(cleaned_df: pd.DataFrame, report: dict, zone_summary: pd.DataFr
         ws.cell(row=row, column=1, value=label).font = Font(bold=True)
         ws.cell(row=row, column=2, value=value)
         row += 1
+
+    # Per-district totals — always shown when more than one district is in
+    # view (i.e. the ALL scope), so districts are never lumped together.
+    zs_all = zone_summary.reset_index()
+    _summary_districts = _districts_in(zs_all)
+    if len(_summary_districts) > 1:
+        row += 1
+        ws.cell(row=row, column=1, value="Totals by District").font = Font(bold=True, size=12)
+        row += 1
+        num_cols = [c for c in zs_all.columns if c not in ("ZONE NAME", "District")]
+        per_district = zs_all.groupby("District")[num_cols].sum().reset_index()
+        row = _write_df(ws, per_district, start_row=row) + 1
 
     row += 1
     ws.cell(row=row, column=1, value="Data Quality Notes").font = Font(bold=True, size=12)
@@ -90,83 +184,73 @@ def build_report(cleaned_df: pd.DataFrame, report: dict, zone_summary: pd.DataFr
 
     # ---------- Cleaned Data sheet ----------
     ws2 = wb.create_sheet("Cleaned Data")
-    _write_df(ws2, cleaned_df[EXPORT_COLS])
+    data_cols = EXPORT_COLS
+    data_sheet_df = cleaned_df
+    if "District" in cleaned_df.columns:
+        data_cols = ["District"] + EXPORT_COLS
+        data_sheet_df = cleaned_df.sort_values(["District", "Date"])
+    _write_df(ws2, data_sheet_df[data_cols])
     ws2.freeze_panes = "A2"
 
     # ---------- Per-Zone sheet ----------
     ws3 = wb.create_sheet("Per-Zone")
-    next_row = _write_df(ws3, zone_summary.reset_index())
-    n = len(zone_summary)
-    chart = BarChart()
-    chart.title = "Birth Registrations by Zone"
-    chart.y_axis.title = "Births Registered"
-    chart.x_axis.title = "Zone"
-    col_birth = zone_summary.reset_index().columns.get_loc("Total Birth Registrations") + 1
-    data = Reference(ws3, min_col=col_birth, min_row=1, max_row=n + 1, max_col=col_birth)
-    cats = Reference(ws3, min_col=1, min_row=2, max_row=n + 1)
-    chart.add_data(data, titles_from_data=True)
-    chart.set_categories(cats)
-    chart.width, chart.height = 20, 10
-    ws3.add_chart(chart, f"A{next_row + 2}")
-
-    chart_nid = BarChart()
-    chart_nid.title = "NID Registrations by Zone"
-    chart_nid.y_axis.title = "NID Registrations"
-    chart_nid.x_axis.title = "Zone"
-    col_nid = zone_summary.reset_index().columns.get_loc("Total NID Registrations") + 1
-    data_nid = Reference(ws3, min_col=col_nid, min_row=1, max_row=n + 1, max_col=col_nid)
-    chart_nid.add_data(data_nid, titles_from_data=True)
-    chart_nid.set_categories(cats)
-    chart_nid.width, chart_nid.height = 20, 10
-    ws3.add_chart(chart_nid, f"J{next_row + 2}")
+    _write_summary_sheet(
+        ws3, zone_summary.reset_index(), label_col="ZONE NAME", entity="Zone",
+        chart_size=(20, 10),
+    )
 
     # ---------- Per-Center sheet ----------
     ws4 = wb.create_sheet("Per-Center")
-    next_row2 = _write_df(ws4, center_summary.reset_index())
-    n2 = len(center_summary)
-    chart2 = BarChart()
-    chart2.title = "Birth Registrations by Center"
-    chart2.y_axis.title = "Births Registered"
-    chart2.x_axis.title = "Center"
-    col_birth2 = center_summary.reset_index().columns.get_loc("Total Birth Registrations") + 1
-    data2 = Reference(ws4, min_col=col_birth2, min_row=1, max_row=n2 + 1, max_col=col_birth2)
-    cats2 = Reference(ws4, min_col=1, min_row=2, max_row=n2 + 1)
-    chart2.add_data(data2, titles_from_data=True)
-    chart2.set_categories(cats2)
-    chart2.width, chart2.height = 24, 12
-    ws4.add_chart(chart2, f"A{next_row2 + 2}")
-
-    chart2_nid = BarChart()
-    chart2_nid.title = "NID Registrations by Center"
-    chart2_nid.y_axis.title = "NID Registrations"
-    chart2_nid.x_axis.title = "Center"
-    col_nid2 = center_summary.reset_index().columns.get_loc("Total NID Registrations") + 1
-    data2_nid = Reference(ws4, min_col=col_nid2, min_row=1, max_row=n2 + 1, max_col=col_nid2)
-    chart2_nid.add_data(data2_nid, titles_from_data=True)
-    chart2_nid.set_categories(cats2)
-    chart2_nid.width, chart2_nid.height = 24, 12
-    ws4.add_chart(chart2_nid, f"J{next_row2 + 2}")
+    _write_summary_sheet(
+        ws4, center_summary.reset_index(), label_col="CENTER NAME", entity="Center",
+        chart_size=(24, 12), chart_top_n=15,
+    )
 
     # ---------- Trend sheet (by date) ----------
-    trend = cleaned_df.groupby(cleaned_df["Date"].dt.date).agg(
-        Total_Birth_Registrations=("Total Birth Registrations", "sum"),
-        Total_NID_Registrations=("Total NID Registrations", "sum"),
-    ).reset_index()
-    trend.columns = ["Date", "Total Birth Registrations", "Total NID Registrations"]
+    # Separate trends per ACTIVITY (Birth vs NID — they're independent
+    # activities, never merged) and per DISTRICT (one line per district when
+    # several are in view, plus an overall total). Charts on top, data below.
     ws5 = wb.create_sheet("Trend")
-    next_row3 = _write_df(ws5, trend)
-    if len(trend) > 1:
-        chart3 = LineChart()
-        chart3.title = "Birth & NID Registrations Over Time"
-        chart3.y_axis.title = "Count"
-        chart3.x_axis.title = "Date"
-        n3 = len(trend)
-        data3 = Reference(ws5, min_col=2, min_row=1, max_row=n3 + 1, max_col=3)
-        cats3 = Reference(ws5, min_col=1, min_row=2, max_row=n3 + 1)
-        chart3.add_data(data3, titles_from_data=True)
-        chart3.set_categories(cats3)
-        chart3.width, chart3.height = 22, 10
-        ws5.add_chart(chart3, f"A{next_row3 + 2}")
+    day = cleaned_df["Date"].dt.date
+    activities = [
+        ("Birth Registrations", "Total Birth Registrations"),
+        ("NID Registrations", "Total NID Registrations"),
+    ]
+    trend_districts = (
+        _districts_in(cleaned_df) if "District" in cleaned_df.columns else []
+    )
+    trend_row = _CHART_ROWS + 2
+    for i, (label, value_col) in enumerate(activities):
+        if len(trend_districts) > 1:
+            pivot = (
+                cleaned_df.groupby([day, "District"])[value_col].sum()
+                .unstack(fill_value=0)
+            )
+            pivot["All Districts"] = pivot.sum(axis=1)
+        else:
+            pivot = cleaned_df.groupby(day)[[value_col]].sum()
+            pivot.columns = [label]
+        pivot.index.name = "Date"
+        tbl = pivot.reset_index()
+
+        ws5.cell(row=trend_row, column=1, value=f"{label} per day").font = Font(bold=True, size=12)
+        header_row = trend_row + 1
+        next_free = _write_df(ws5, tbl, start_row=header_row)
+        n_days = len(tbl)
+        if n_days > 1:
+            chart = LineChart()
+            chart.title = f"{label} Over Time" + (" — by District" if len(trend_districts) > 1 else "")
+            chart.y_axis.title = label
+            chart.x_axis.title = "Date"
+            data = Reference(ws5, min_col=2, min_row=header_row,
+                             max_row=header_row + n_days, max_col=len(tbl.columns))
+            cats = Reference(ws5, min_col=1, min_row=header_row + 1, max_row=header_row + n_days)
+            chart.add_data(data, titles_from_data=True)
+            chart.set_categories(cats)
+            chart.width, chart.height = 16, 10
+            # Charts sit side by side at the top; their tables follow below.
+            ws5.add_chart(chart, f"{get_column_letter(1 + i * 10)}1")
+        trend_row = next_free + 1
 
     # ---------- Flagged rows sheet ----------
     ws6 = wb.create_sheet("Flagged Rows")
@@ -205,14 +289,20 @@ def build_report(cleaned_df: pd.DataFrame, report: dict, zone_summary: pd.DataFr
     return buf.getvalue()
 
 
-def build_completion_report(zone_df: pd.DataFrame, center_df: pd.DataFrame, start_date, end_date) -> bytes:
-    """Excel export for master_reference.completion_report()'s output: one
-    sheet per predefined zone, one per predefined center — figures only
+def build_completion_report(district_df: pd.DataFrame, zone_df: pd.DataFrame,
+                            center_df: pd.DataFrame, start_date, end_date) -> bytes:
+    """Excel export for master_reference.completion_report()'s output: a
+    district summary sheet, then per-zone and per-center sheets — figures only
     reflect submissions already mapped to the predefined master list."""
     wb = Workbook()
 
-    ws = wb.active
-    ws.title = "Zone Completion"
+    ws0 = wb.active
+    ws0.title = "District Completion"
+    ws0["A1"] = f"District Completion — {start_date} to {end_date}"
+    ws0["A1"].font = Font(bold=True, size=14)
+    _write_df(ws0, district_df, start_row=3)
+
+    ws = wb.create_sheet("Zone Completion")
     ws["A1"] = f"Zone Completion — {start_date} to {end_date}"
     ws["A1"].font = Font(bold=True, size=14)
     _write_df(ws, zone_df, start_row=3)

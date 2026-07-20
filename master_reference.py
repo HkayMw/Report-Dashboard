@@ -7,18 +7,17 @@ official school/center registry PDFs) and provides:
     them independently is simpler than picking both at once)
   - a lightweight per-zone submission matrix (center x day)
 
-This is a static reference bundled with the app (master_reference.csv).
-Assignments persist in config.json (flat file — plenty for a few hundred
-entries at most, no need for a database at this scale).
+The default reference is bundled with the app (master_reference.csv);
+phases can supply their own CSV via phases.py. Assignment persistence is
+phase-scoped and lives in phases.json (see phases.py) — the functions here
+are pure apply/find helpers.
 """
 import os
 import re
-import json
 import difflib
 import pandas as pd
 
 REFERENCE_PATH = os.path.join(os.path.dirname(__file__), "master_reference.csv")
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 
 
 def _normalize(s: str) -> str:
@@ -40,11 +39,51 @@ def _strip_suffix_noise(s_norm: str) -> str:
     return cur
 
 
-def load_master() -> pd.DataFrame:
-    df = pd.read_csv(REFERENCE_PATH)
+def load_master(path: str = REFERENCE_PATH) -> pd.DataFrame:
+    """Load a master reference CSV (District, Zone, Center). Defaults to the
+    bundled list; phases can point at their own CSV via phases.py."""
+    df = pd.read_csv(path)
     df["Zone_norm"] = df["Zone"].apply(_normalize)
     df["Center_norm"] = df["Center"].apply(_normalize)
     return df
+
+
+def district_options(master_df: pd.DataFrame) -> list:
+    return sorted(master_df["District"].dropna().unique())
+
+
+def filter_by_district(cleaned_df: pd.DataFrame, master_df: pd.DataFrame, district: str):
+    """Scope both the submitted data and the master list to one district.
+
+    A submitted row belongs to a district via its (assignment-corrected) zone,
+    looked up against the master list — the form itself never asks for a
+    district. Rows whose zone doesn't match any master zone can't be placed in
+    a district, so they are excluded from single-district views (they still
+    appear under ALL); resolving them via Zone Assignment brings them in.
+    """
+    zone_district = dict(zip(master_df["Zone_norm"], master_df["District"]))
+    mask = cleaned_df["ZONE NAME"].apply(_normalize).map(zone_district) == district
+    return cleaned_df[mask], master_df[master_df["District"] == district]
+
+
+def normalize_name(s) -> str:
+    """Public name normalizer for callers that need to match submitted
+    zone/center text against the master list (same rules used internally)."""
+    return _normalize(s)
+
+
+def districts_for_zones(zones, master_df: pd.DataFrame) -> list:
+    """Map an iterable of zone names to their master-list district
+    ('' for zones that don't match any master zone)."""
+    lookup = dict(zip(master_df["Zone_norm"], master_df["District"]))
+    return [lookup.get(_normalize(z), "") for z in zones]
+
+
+def districts_for_centers(centers, master_df: pd.DataFrame) -> list:
+    """Map an iterable of center names to their master-list district
+    ('' for centers that don't match any master center)."""
+    lookup = dict(zip(master_df["Center_norm"], master_df["District"]))
+    return [lookup.get(_normalize(c), "") for c in centers]
 
 
 def master_zone_set(master_df: pd.DataFrame) -> set:
@@ -64,37 +103,9 @@ def centers_by_zone(master_df: pd.DataFrame) -> dict:
 
 # ---------------------------------------------------------------------------
 # Zone assignment — for submitted zone values that don't match any known zone.
-# Persisted as a simple raw_zone -> correct_zone mapping (flat file, plenty
-# for the handful of entries this will ever have).
+# Persistence is phase-scoped and lives in phases.py (phases.json); the
+# apply/find functions here are pure and storage-agnostic.
 # ---------------------------------------------------------------------------
-
-def load_zone_assignments() -> dict:
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH) as f:
-                return json.load(f).get("zone_assignments", {})
-        except Exception:
-            return {}
-    return {}
-
-
-def save_zone_assignment(raw_zone: str, correct_zone: str) -> None:
-    data = {}
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH) as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-    zone_assignments = data.get("zone_assignments", {})
-    zone_assignments[raw_zone] = correct_zone
-    data["zone_assignments"] = zone_assignments
-    try:
-        with open(CONFIG_PATH, "w") as f:
-            json.dump(data, f)
-    except Exception:
-        pass
-
 
 def apply_zone_assignments(df: pd.DataFrame, zone_assignments: dict) -> pd.DataFrame:
     if not zone_assignments:
@@ -127,41 +138,10 @@ def find_unmatched_zones(cleaned_df: pd.DataFrame, master_df: pd.DataFrame) -> l
 # center under their (already-corrected) zone. Kept separate from zone
 # assignment on purpose: usually only one of the two is actually wrong, and
 # fixing them independently is simpler than picking both at once.
-# Persisted as a list of {"zone", "raw_center", "center"} — zone-scoped
-# because the same wrong text could need a different fix under different zones.
+# Stored as a list of {"zone", "raw_center", "center"} — zone-scoped because
+# the same wrong text could need a different fix under different zones.
+# Persistence is phase-scoped and lives in phases.py (phases.json).
 # ---------------------------------------------------------------------------
-
-def load_center_assignments() -> list:
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH) as f:
-                return json.load(f).get("center_assignments", [])
-        except Exception:
-            return []
-    return []
-
-
-def save_center_assignment(zone: str, raw_center: str, correct_center: str) -> None:
-    data = {}
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH) as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-    assignments = data.get("center_assignments", [])
-    assignments = [
-        a for a in assignments
-        if not (_normalize(a["zone"]) == _normalize(zone) and _normalize(a["raw_center"]) == _normalize(raw_center))
-    ]
-    assignments.append({"zone": zone, "raw_center": raw_center, "center": correct_center})
-    data["center_assignments"] = assignments
-    try:
-        with open(CONFIG_PATH, "w") as f:
-            json.dump(data, f)
-    except Exception:
-        pass
-
 
 def apply_center_assignments(df: pd.DataFrame, center_assignments: list) -> pd.DataFrame:
     """Applied AFTER zone assignments, so the zone half of the lookup key is
@@ -240,10 +220,11 @@ def completion_report(cleaned_df: pd.DataFrame, master_df: pd.DataFrame, start_d
     zone or center hasn't been assigned/mapped yet is excluded entirely, so
     completion figures never get inflated by not-yet-reconciled data.
 
-    Returns (zone_df, center_df):
-      center_df: one row per predefined center — Zone, Center, Days Expected,
-                 Days Submitted, Completion %
+    Returns (district_df, zone_df, center_df):
+      center_df: one row per predefined center — District, Zone, Center,
+                 Days Expected, Days Submitted, Completion %
       zone_df: one row per predefined zone — aggregated across its centers
+      district_df: one row per district — aggregated across its zones
     """
     date_cols = list(pd.date_range(start_date, end_date, freq="D").date)
     n_days = len(date_cols)
@@ -261,30 +242,43 @@ def completion_report(cleaned_df: pd.DataFrame, master_df: pd.DataFrame, start_d
 
     submitted_days = sub.groupby(["_zone_norm", "_center_norm"])["_date"].nunique()
 
-    centers = master_df[["Zone", "Center", "Zone_norm", "Center_norm"]].drop_duplicates()
+    centers = master_df[["District", "Zone", "Center", "Zone_norm", "Center_norm"]].drop_duplicates()
     center_rows = []
     for _, row in centers.iterrows():
         key = (row["Zone_norm"], row["Center_norm"])
         submitted = int(submitted_days.get(key, 0))
         center_rows.append({
+            "District": row["District"],
             "Zone": row["Zone"],
             "Center": row["Center"],
             "Days Expected": n_days,
             "Days Submitted": submitted,
             "Completion %": round(100 * submitted / n_days, 1) if n_days else 0.0,
         })
-    center_df = pd.DataFrame(center_rows).sort_values(["Zone", "Center"]).reset_index(drop=True)
+    center_df = pd.DataFrame(center_rows).sort_values(["District", "Zone", "Center"]).reset_index(drop=True)
 
     zone_df = center_df.groupby("Zone").agg(
+        District=("District", "first"),
         Centers=("Center", "count"),
         **{"Total Days Expected": ("Days Expected", "sum"), "Total Days Submitted": ("Days Submitted", "sum")},
     ).reset_index()
     zone_df["Completion %"] = (
         100 * zone_df["Total Days Submitted"] / zone_df["Total Days Expected"]
     ).round(1)
-    zone_df = zone_df.sort_values("Zone").reset_index(drop=True)
+    zone_df = zone_df[["District", "Zone", "Centers", "Total Days Expected", "Total Days Submitted", "Completion %"]]
+    zone_df = zone_df.sort_values(["District", "Zone"]).reset_index(drop=True)
 
-    return zone_df, center_df
+    district_df = center_df.groupby("District").agg(
+        Zones=("Zone", "nunique"),
+        Centers=("Center", "count"),
+        **{"Total Days Expected": ("Days Expected", "sum"), "Total Days Submitted": ("Days Submitted", "sum")},
+    ).reset_index()
+    district_df["Completion %"] = (
+        100 * district_df["Total Days Submitted"] / district_df["Total Days Expected"]
+    ).round(1)
+    district_df = district_df.sort_values("District").reset_index(drop=True)
+
+    return district_df, zone_df, center_df
 
 
 def zone_center_matrix(cleaned_df: pd.DataFrame, master_df: pd.DataFrame, zone: str, start_date, end_date):
